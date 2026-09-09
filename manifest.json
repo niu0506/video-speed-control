@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "视频倍速播放",
+  "version": "1.0.0",
+  "description": "一键控制网页视频播放速度（0.25x - 16x）",
+  "permissions": ["storage"],
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "视频倍速播放"
+  }
+}

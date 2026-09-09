@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <style>
+    body {
+      width: 220px;
+      margin: 0;
+      padding: 12px;
+      font-family: -apple-system, "PingFang SC", sans-serif;
+      background: #1e1e2e;
+      color: #e0e0ef;
+    }
+    h1 { font-size: 14px; margin: 0 0 10px; text-align: center; font-weight: 600; }
+    .current {
+      font-size: 26px;
+      text-align: center;
+      font-weight: 700;
+      color: #7c9cff;
+      margin-bottom: 10px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 6px;
+    }
+    button {
+      padding: 7px 0;
+      border: 1px solid #3a3a52;
+      border-radius: 6px;
+      background: #2a2a40;
+      color: #e0e0ef;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    button:hover { background: #3a3a55; }
+    button.active { background: #5b7cff; border-color: #5b7cff; }
+    input[type="range"] { width: 100%; margin-top: 12px; accent-color: #5b7cff; }
+    .tip {
+      font-size: 11px;
+      color: #8888a8;
+      text-align: center;
+      margin-top: 8px;
+      min-height: 14px;
+    }
+    .settings {
+      display: block;
+      margin-top: 10px;
+      text-align: center;
+      font-size: 12px;
+      color: #7c9cff;
+      cursor: pointer;
+      text-decoration: underline;
+    }
+    .settings:hover { color: #9ab0ff; }
+    .blocked {
+      font-size: 12px;
+      color: #ff7a8a;
+      text-align: center;
+      margin-top: 4px;
+    }
+    /* 排除网站视图 */
+    .desc { color: #8888a8; font-size: 11px; line-height: 1.6; margin: 0 0 10px; }
+    .desc code { color: #7c9cff; }
+    .add-row { display: flex; gap: 6px; margin-bottom: 6px; }
+    input[type="text"] {
+      flex: 1;
+      min-width: 0;
+      padding: 7px 10px;
+      border: 1px solid #3a3a52;
+      border-radius: 6px;
+      background: #2a2a40;
+      color: #e0e0ef;
+      font-size: 12px;
+      font-family: ui-monospace, Menlo, monospace;
+    }
+    input[type="text"]:focus { outline: none; border-color: #5b7cff; }
+    .btn-add {
+      flex-shrink: 0;
+      padding: 7px 12px;
+      border-color: #5b7cff;
+      background: #5b7cff;
+      color: #fff;
+    }
+    .btn-add:hover { background: #4a6ce6; }
+    .error { color: #ff7a8a; font-size: 11px; min-height: 16px; }
+    ul {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+      max-height: 240px;
+      overflow-y: auto;
+    }
+    li {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 10px;
+      border: 1px solid #3a3a52;
+      border-radius: 6px;
+      background: #2a2a40;
+      margin-bottom: 6px;
+      font-family: ui-monospace, Menlo, monospace;
+      font-size: 12px;
+      word-break: break-all;
+    }
+    li .del {
+      flex-shrink: 0;
+      margin-left: auto;
+      padding: 3px 8px;
+      border: 1px solid #553a4a;
+      background: transparent;
+      color: #ff7a8a;
+      font-size: 11px;
+    }
+    li .del:hover { background: #3a2a35; }
+    .empty { color: #666688; font-size: 12px; text-align: center; padding: 16px 0; }
+  </style>
+</head>
+<body>
+  <!-- 调速面板 -->
+  <div id="speedView">
+    <h1>视频倍速播放</h1>
+    <div class="current" id="current">1.00x</div>
+    <div class="grid" id="presets">
+      <button data-rate="0.5">0.5x</button>
+      <button data-rate="1">1x</button>
+      <button data-rate="1.5">1.5x</button>
+      <button data-rate="2">2x</button>
+      <button data-rate="3">3x</button>
+      <button data-rate="4">4x</button>
+      <button data-rate="8">8x</button>
+      <button data-rate="16">16x</button>
+    </div>
+    <input type="range" id="slider" min="0.25" max="16" step="0.25" />
+    <div class="blocked" id="blocked" style="display:none">⚠ 此页面在排除列表中</div>
+    <div class="tip" id="tip"></div>
+    <span class="settings" id="openOptions">排除网站设置</span>
+  </div>
+
+  <!-- 排除网站管理 -->
+  <div id="blockView" style="display:none">
+    <h1>排除网站</h1>
+    <p class="desc">
+      命中以下任一正则的页面将<b>不会被加速</b>。正则匹配完整 URL，例如
+      <code>bilibili\.com</code>。规则按每个 frame 的 URL 分别判断；SPA 站内
+      跳转后约 1.5 秒内重新生效，无需刷新。
+    </p>
+    <div class="add-row">
+      <input type="text" id="input" placeholder="输入正则，如 example\.com" />
+      <button class="btn-add" id="add">添加</button>
+    </div>
+    <div class="error" id="error"></div>
+    <ul id="list"></ul>
+    <div class="empty" id="empty">暂无排除规则</div>
+    <span class="settings" id="backSpeed">← 返回调速</span>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>
