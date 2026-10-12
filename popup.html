@@ -36,6 +36,30 @@
     button:hover { background: #3a3a55; }
     button.active { background: #5b7cff; border-color: #5b7cff; }
     input[type="range"] { width: 100%; margin-top: 12px; accent-color: #5b7cff; }
+    .wfs {
+      display: block;
+      width: 100%;
+      margin-top: 12px;
+      border-color: #5b7cff;
+      background: #5b7cff;
+      color: #fff;
+      font-weight: 600;
+    }
+    .wfs:hover { background: #4a6ce6; }
+    .wfs.on { background: #2a2a40; border-color: #3a3a52; color: #e0e0ef; font-weight: 400; }
+    .toggle {
+      display: block;
+      width: 100%;
+      margin-top: 8px;
+      font-size: 12px;
+      color: #a8b0d0;
+    }
+    .toggle.on {
+      border-color: #5b7cff;
+      background: #2b3358;
+      color: #9ab0ff;
+      font-weight: 600;
+    }
     .tip {
       font-size: 11px;
       color: #8888a8;
@@ -133,6 +157,8 @@
       <button data-rate="16">16x</button>
     </div>
     <input type="range" id="slider" min="0.25" max="16" step="0.25" />
+    <button class="wfs" id="webFullscreen">网页全屏</button>
+    <button class="toggle" id="autoFs">自动网页全屏播放：关</button>
     <div class="blocked" id="blocked" style="display:none">⚠ 此页面在排除列表中</div>
     <div class="tip" id="tip"></div>
     <span class="settings" id="openOptions">排除网站设置</span>

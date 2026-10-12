@@ -65,13 +65,54 @@ $("slider").addEventListener("input", (e) => {
 });
 $("slider").addEventListener("change", (e) => setSpeed(Number(e.target.value)));
 
+// 网页全屏
+function setWebFullscreenUI(on) {
+  const btn = $("webFullscreen");
+  btn.textContent = on ? "退出网页全屏" : "网页全屏";
+  btn.classList.toggle("on", on);
+}
+
+// 自动网页全屏开关
+async function refreshAutoFsUI() {
+  const { autoWebFullscreen } = await chrome.storage.local.get({
+    autoWebFullscreen: false,
+  });
+  const btn = $("autoFs");
+  btn.textContent = "自动网页全屏播放：" + (autoWebFullscreen ? "开" : "关");
+  btn.classList.toggle("on", autoWebFullscreen);
+}
+
+$("autoFs").addEventListener("click", async () => {
+  const { autoWebFullscreen } = await chrome.storage.local.get({
+    autoWebFullscreen: false,
+  });
+  await chrome.storage.local.set({ autoWebFullscreen: !autoWebFullscreen });
+  refreshAutoFsUI();
+});
+
+$("webFullscreen").addEventListener("click", async () => {
+  const res = await sendToTab({ type: "toggleWebFullscreen" });
+  if (!res) return;
+  if (res.found === false) {
+    $("tip").textContent = "未检测到视频（请先播放）";
+    return;
+  }
+  setWebFullscreenUI(res.webFullscreen);
+  window.close(); // 关闭弹窗，立即查看效果
+});
+
 // 视图切换按钮
 $("openOptions").addEventListener("click", () => showView("block"));
 $("backSpeed").addEventListener("click", () => showView("speed"));
 
+// 默认排除规则（与 content.js 保持一致）
+const DEFAULT_BLOCKLIST = ["/list/", "live", "missav", "list=WL", "wanyiwan"];
+
 // 读取/保存排除列表
 async function getBlocklist() {
-  const { blocklist } = await chrome.storage.local.get({ blocklist: [] });
+  const { blocklist } = await chrome.storage.local.get({
+    blocklist: DEFAULT_BLOCKLIST,
+  });
   return blocklist;
 }
 
@@ -146,11 +187,13 @@ $("input").addEventListener("keydown", (e) => {
 
 // 初始化：读取当前调速状态
 (async () => {
+  refreshAutoFsUI();
   const { rate } = await chrome.storage.local.get({ rate: 1.0 });
   const res = await sendToTab({ type: "getSpeed" });
   if (res) {
     setBlockedUI(res.blocked);
     setCurrent(res.blocked ? 1.0 : res.rate, res.count);
+    setWebFullscreenUI(!!res.webFullscreen);
   } else {
     setCurrent(rate, 0);
   }
