@@ -9,22 +9,36 @@ function showView(name) {
   if (name === "block") getBlocklist().then(renderBlocklist);
 }
 
-// 显示/隐藏排除提示
+// 显示/隐藏排除提示，并给预设与滑块加视觉禁用态（仍可点击写入 storage）
 function setBlockedUI(blocked) {
   $("blocked").style.display = blocked ? "block" : "none";
+  document.querySelectorAll("#presets button").forEach((b) =>
+    b.classList.toggle("dim", blocked)
+  );
+  $("slider").classList.toggle("dim", blocked);
   return blocked;
 }
 
-// 更新当前速度 UI
-function setCurrent(rate, videoCount) {
+// 更新当前速度 UI（只处理数值与高亮，不涉及提示文案）
+function setCurrent(rate) {
   currentRate = rate;
   $("current").textContent = rate.toFixed(2) + "x";
   $("slider").value = rate;
   document.querySelectorAll("#presets button").forEach((b) => {
     b.classList.toggle("active", Number(b.dataset.rate) === rate);
   });
-  $("tip").textContent =
-    videoCount > 0 ? `已应用到 ${videoCount} 个视频` : "未检测到视频（请先播放）";
+}
+
+// 提示文案：「是否被排除」优先于「有无视频」
+function setTip(blocked, videoCount) {
+  if (blocked) {
+    $("tip").textContent = "此页面已被排除，调速未生效";
+  } else {
+    $("tip").textContent =
+      videoCount > 0
+        ? `已应用到 ${videoCount} 个视频`
+        : "未检测到视频（请先播放）";
+  }
 }
 
 // 向当前标签页的 content script 发送消息
@@ -40,13 +54,12 @@ async function sendToTab(msg) {
 
 // 设置倍速并保存
 async function setSpeed(rate) {
-  setBlockedUI(false);
-  setCurrent(rate, 0);
   chrome.storage.local.set({ rate });
+  setCurrent(rate);
   const res = await sendToTab({ type: "setSpeed", rate });
   if (res) {
     setBlockedUI(res.blocked);
-    setCurrent(rate, res.count);
+    setTip(res.blocked, res.count);
   }
 }
 
@@ -105,7 +118,7 @@ $("webFullscreen").addEventListener("click", async () => {
 $("openOptions").addEventListener("click", () => showView("block"));
 $("backSpeed").addEventListener("click", () => showView("speed"));
 
-// 默认排除规则（与 content.js 保持一致）
+// 仅作 storage 读取失败时的兜底，真实来源是 storage
 const DEFAULT_BLOCKLIST = ["/list/", "live", "missav", "list=WL", "wanyiwan"];
 
 // 读取/保存排除列表
@@ -192,9 +205,11 @@ $("input").addEventListener("keydown", (e) => {
   const res = await sendToTab({ type: "getSpeed" });
   if (res) {
     setBlockedUI(res.blocked);
-    setCurrent(res.blocked ? 1.0 : res.rate, res.count);
+    setCurrent(res.blocked ? 1.0 : res.rate);
+    setTip(res.blocked, res.count);
     setWebFullscreenUI(!!res.webFullscreen);
   } else {
-    setCurrent(rate, 0);
+    // 页面不可注入时 sendToTab 已提示「此页面不可用，刷新后重试」，此处不再覆盖
+    setCurrent(rate);
   }
 })();

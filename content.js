@@ -3,7 +3,7 @@ let currentRate = 1.0;
 let blocked = false;
 let autoFullscreen = false;
 
-// 默认排除规则（首次使用时预置，用户可在设置里增删）
+// 仅作 storage 读取失败时的兜底，真实来源是 storage
 const DEFAULT_BLOCKLIST = ["/list/", "live", "missav", "list=WL", "wanyiwan"];
 
 // 排除规则的正则缓存
@@ -172,6 +172,7 @@ let fsSavedParent = null;
 let fsSavedNext = null;
 let fsSavedControls = null;
 let fsUIHandlers = null;
+let fsWheelHandler = null;
 
 // 选择目标视频：优先正在播放的
 function pickVideo() {
@@ -219,12 +220,6 @@ function injectFsStyle() {
     #${OVERLAY_ID} {
       position: fixed !important;
       inset: 0 !important;
-      top: 0 !important;
-      left: 0 !important;
-      right: 0 !important;
-      bottom: 0 !important;
-      width: 100vw !important;
-      height: 100vh !important;
       margin: 0 !important;
       padding: 0 !important;
       background: #000 !important;
@@ -343,6 +338,10 @@ function enterWebFullscreen(v) {
   document.documentElement.appendChild(overlay);
   fsOverlay = overlay;
 
+  // 拦截滚轮，避免穿透到页面导致背景滚动（退出时解绑，不改变原滚动位置）
+  fsWheelHandler = (e) => e.preventDefault();
+  overlay.addEventListener("wheel", fsWheelHandler, { passive: false });
+
   overlay.appendChild(buildFsUI(v));
 
   updateTrackBtn();
@@ -354,7 +353,7 @@ function fmtTime(t) {
   const h = Math.floor(t / 3600);
   const m = Math.floor((t % 3600) / 60);
   const s = Math.floor(t % 60);
-  const mm = String(h ? m : m).padStart(h ? 2 : 1, "0");
+  const mm = String(m).padStart(h ? 2 : 0, "0");
   return (h ? h + ":" : "") + mm + ":" + String(s).padStart(2, "0");
 }
 
@@ -483,24 +482,41 @@ function exitWebFullscreen() {
     fsUIHandlers = null;
   }
 
-  if (v.isConnected) {
-    v.removeAttribute("style");
-    if (fsSavedStyle) v.setAttribute("style", fsSavedStyle);
-    if (fsSavedControls !== null) v.controls = fsSavedControls;
-    if (fsSavedParent && fsSavedParent.isConnected) {
-      fsSavedParent.insertBefore(v, fsSavedNext || null);
-    }
-  }
-  fsSavedStyle = null;
-  fsSavedParent = null;
-  fsSavedNext = null;
-  fsSavedControls = null;
+  try {
+    if (v.isConnected) {
+      v.removeAttribute("style");
+      if (fsSavedStyle) v.setAttribute("style", fsSavedStyle);
+      if (fsSavedControls !== null) v.controls = fsSavedControls;
 
-  if (fsOverlay) {
-    fsOverlay.remove();
-    fsOverlay = null;
+      if (fsSavedParent && fsSavedParent.isConnected) {
+        // 原后继节点可能已被站点移除，只有仍属于原父节点时才可作锚点，
+        // 否则回退为空（等价 appendChild），避免 insertBefore 抛 NotFoundError
+        const anchor =
+          fsSavedNext && fsSavedNext.parentNode === fsSavedParent
+            ? fsSavedNext
+            : null;
+        fsSavedParent.insertBefore(v, anchor);
+      } else {
+        // 原父节点已断开：先把视频移出遮罩，避免它随遮罩一起被移除
+        (document.body || document.documentElement).appendChild(v);
+      }
+    }
+  } finally {
+    // 无论恢复视频是否出错，都保证遮罩与状态被清理
+    if (fsOverlay) {
+      if (fsWheelHandler) {
+        fsOverlay.removeEventListener("wheel", fsWheelHandler);
+        fsWheelHandler = null;
+      }
+      fsOverlay.remove();
+      fsOverlay = null;
+    }
+    fsSavedStyle = null;
+    fsSavedParent = null;
+    fsSavedNext = null;
+    fsSavedControls = null;
+    updateTrackBtn();
   }
-  updateTrackBtn();
 }
 
 // 返回 true=已进入，false=已退出，null=没有可用视频
@@ -509,7 +525,9 @@ function toggleWebFullscreen() {
     exitWebFullscreen();
     return false;
   }
-  const v = pickVideo();
+  // 优先使用悬浮按钮当前定位到的视频，保证与用户看到的那个一致
+  const v =
+    trackedVideo && trackedVideo.isConnected ? trackedVideo : pickVideo();
   if (!v) return null;
   enterWebFullscreen(v);
   return true;
@@ -631,7 +649,7 @@ function refreshBlocked(callback) {
 window.addEventListener("popstate", () => refreshBlocked());
 window.addEventListener("hashchange", () => refreshBlocked());
 if (typeof navigation !== "undefined") {
-  navigation.addEventListener("navigate", () => refreshBlocked());
+  navigation.addEventListener("currententrychange", () => refreshBlocked());
 }
 
 // 兜底轮询：捕获无事件的 SPA 跳转
@@ -692,17 +710,37 @@ const autoDone = new WeakSet();
 function maybeAutoFullscreen(v) {
   if (!isTop || !autoFullscreen || blocked || fsVideo) return;
   if (autoDone.has(v)) return;
-  const r = v.getBoundingClientRect();
-  // 忽略小尺寸视频（广告、预览、角标播放器等）
-  if (r.width < 400 || r.height < 200) return;
-  autoDone.add(v);
-  enterWebFullscreen(v);
+
+  const fits = () => {
+    const r = v.getBoundingClientRect();
+    return r.width >= 400 && r.height >= 200;
+  };
+
+  if (fits()) {
+    autoDone.add(v);
+    enterWebFullscreen(v);
+    return;
+  }
+  // 尺寸暂不满足（可能尚未完成布局），稍后重新检查一次，仍不满足则放弃
+  setTimeout(() => {
+    if (!isTop || !autoFullscreen || blocked || fsVideo) return;
+    if (autoDone.has(v) || !v.isConnected) return;
+    if (!fits()) return;
+    autoDone.add(v);
+    enterWebFullscreen(v);
+  }, 300);
 }
 
-// 开关变化时立即生效，无需刷新页面
+// 开关/倍速变化时立即生效，无需刷新页面
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area !== "local" || !changes.autoWebFullscreen) return;
-  autoFullscreen = !!changes.autoWebFullscreen.newValue;
+  if (area !== "local") return;
+  if (changes.autoWebFullscreen) {
+    autoFullscreen = !!changes.autoWebFullscreen.newValue;
+  }
+  // 其他标签页改变倍速时同步；被排除页面忽略
+  if (changes.rate && !blocked) {
+    applySpeed(changes.rate.newValue);
+  }
 });
 
 // 初始化：应用已保存的速度并判断排除状态

@@ -4,6 +4,7 @@
   "version": "1.0.0",
   "description": "一键控制网页视频播放速度（0.25x - 16x）",
   "permissions": ["storage"],
+  "host_permissions": ["http://*/*", "https://*/*"],
   "content_scripts": [
     {
       "matches": ["http://*/*", "https://*/*"],
