@@ -119,7 +119,15 @@ $("openOptions").addEventListener("click", () => showView("block"));
 $("backSpeed").addEventListener("click", () => showView("speed"));
 
 // 仅作 storage 读取失败时的兜底，真实来源是 storage
-const DEFAULT_BLOCKLIST = ["/list/", "live", "missav", "list=WL", "wanyiwan"];
+// 注意：不要用 `live` 这种短词，会误伤 URL 里含 live 的正常页面
+const DEFAULT_BLOCKLIST = [
+  "/list/",
+  "//live\\.",
+  "missav",
+  "list=WL",
+  "&list=",
+  "wanyiwan",
+];
 
 // 读取/保存排除列表
 async function getBlocklist() {

@@ -3,27 +3,79 @@ let currentRate = 1.0;
 let blocked = false;
 let autoFullscreen = false;
 
-// 仅作 storage 读取失败时的兜底，真实来源是 storage
-const DEFAULT_BLOCKLIST = ["/list/", "live", "missav", "list=WL", "wanyiwan"];
+// 历史默认表：命中其中任一份，说明用户从未自定义过排除规则，
+// 升级为当前默认表。第一份是初版（`live` 宽松匹配会误伤 `?is_live=1` 这类地址），
+// 第二份是加入 `&list=` 之前的版本。
+const HISTORICAL_DEFAULT_BLOCKLISTS = [
+  ["/list/", "live", "missav", "list=WL", "wanyiwan"],
+  ["/list/", "//live\\.", "missav", "list=WL", "wanyiwan"],
+];
 
-// 排除规则的正则缓存
-let compiledRules = [];
+// 仅作 storage 读取失败时的兜底，真实来源是 storage
+const DEFAULT_BLOCKLIST = [
+  "/list/",
+  "//live\\.",
+  "missav",
+  "list=WL",
+  "&list=",
+  "wanyiwan",
+];
+
+function sameList(a, b) {
+  return a.length === b.length && a.every((p, i) => p === b[i]);
+}
+
+// 把未改动过的历史默认表升级成当前默认表
+// 用户自己加过/删过规则的列表不会被改动
+function migrateBlocklist(list) {
+  if (!HISTORICAL_DEFAULT_BLOCKLISTS.some((def) => sameList(def, list))) {
+    return list;
+  }
+  chrome.storage.local.set({ blocklist: DEFAULT_BLOCKLIST });
+  return DEFAULT_BLOCKLIST;
+}
+
+// 排除规则匹配语义：
+// 规则可能是域名（bilibili\.com）、路径（/list/）或参数（list=WL）。
+// 旧实现拿完整 URL 直接 test，于是 `live` 这种短词会命中 `?is_live=1`、`alive`，
+// 整页被误判成排除页并被打回 1x —— 刷抖音时表现为「突然没倍速了」。
+// 现在分两条路：
+//   - 规则以 `//` 或 `scheme://` 开头 → 视为「整条 URL」规则（如 `//live\.`），用完整 URL 匹配；
+//   - 其他规则 → 用 host + pathname + search 匹配，避开协议与 hash 干扰。
+const compiledRules = [];
+
+function compileRule(p) {
+  try {
+    return { re: new RegExp(p), full: p.includes("://") || p.startsWith("//") };
+  } catch {
+    return null;
+  }
+}
 
 function setBlocklist(list) {
-  compiledRules = list
-    .map((p) => {
-      try {
-        return new RegExp(p);
-      } catch {
-        return null;
-      }
-    })
-    .filter(Boolean);
+  compiledRules.length = 0;
+  for (const p of list) {
+    const r = compileRule(p);
+    if (r) compiledRules.push(r);
+  }
 }
 
 // 当前 URL 是否命中排除规则
 function isBlockedUrl(url) {
-  return compiledRules.some((re) => re.test(url));
+  let u;
+  try {
+    u = new URL(url);
+  } catch {
+    return compiledRules.some((r) => r.re.test(url));
+  }
+  const host = u.hostname.toLowerCase();
+  // 两套候选串：带协议（给 `//live\.` 这类域名/URL 规则用）与不带（给路径、参数规则用）。
+  // 非 full 规则只测 shortTarget，避免 `live` 这类短词又误命中 `alive.com`。
+  const fullTarget = u.protocol + "//" + host + u.pathname + u.search;
+  const shortTarget = host + u.pathname + u.search;
+  return compiledRules.some((r) =>
+    r.full ? r.re.test(fullTarget) : r.re.test(shortTarget)
+  );
 }
 
 // 监听 DOM 变化，发现新视频
@@ -50,54 +102,109 @@ function collectVideos(root) {
   return videos;
 }
 
-// 外部持续改速时的对抗上限与冷却期
-const FIGHT_LIMIT = 5;
-const COOLDOWN = 10000;
+// 外部持续改速时的写入限流：只做滑动窗口限速，不设「放弃期」。
+// 旧实现是「累计 5 次就静默 10 秒」，而站点每次重置速度都算一次，
+// 刷几个视频就进入静默期且结束后无人补救 → 表现成「时不时失效」。
+// 这里只防真正的 ping-pong 死循环：1 秒内写超过 25 次就跳过本次，
+// 但 500ms 一次的低频校对不受限，保证最多 0.5s 后一定回到目标倍速。
+const WRITE_WINDOW = 1000;
+const WRITE_LIMIT = 25;
 
-// 已绑定的视频，避免重复绑定
+// 已绑定的视频：WeakSet 用于去重，boundList 用于低频校对时遍历
 const boundVideos = new WeakSet();
+const boundList = [];
+
+// 每个视频的写入时间戳，用于限流
+const writeLogs = new WeakMap();
+
+// 正在由本扩展写速的视频：避免自己写的值又触发 ratechange 造成自锁/重复计数
+const writing = new WeakSet();
+
+// 限流：同一视频 1 秒内最多纠正 WRITE_LIMIT 次，超出就跳过本次（下个事件/校对再补）
+function canWrite(v) {
+  const now = Date.now();
+  let log = writeLogs.get(v);
+  if (!log) {
+    log = [];
+    writeLogs.set(v, log);
+  }
+  while (log.length && now - log[0] > WRITE_WINDOW) log.shift();
+  if (log.length >= WRITE_LIMIT) return false;
+  log.push(now);
+  return true;
+}
+
+// 同时写 defaultPlaybackRate：媒体重新加载（换 src / load()）时浏览器会把
+// playbackRate 重置成 defaultPlaybackRate，只写 playbackRate 会被打回 1x
+function setRate(v, rate) {
+  if (writing.has(v)) return;
+  writing.add(v);
+  try {
+    if (Math.abs(v.defaultPlaybackRate - rate) > 1e-6) {
+      v.defaultPlaybackRate = rate;
+    }
+    if (Math.abs(v.playbackRate - rate) > 1e-6) v.playbackRate = rate;
+  } catch {
+    // 视频已进入不可写状态（如被移除），忽略
+  } finally {
+    writing.delete(v);
+  }
+}
+
+// 当前视频速度是否已是我们想要的状态
+function rateMatches(v, rate) {
+  return (
+    Math.abs(v.playbackRate - rate) < 1e-6 &&
+    Math.abs(v.defaultPlaybackRate - rate) < 1e-6
+  );
+}
 
 // 绑定视频：设置速度并恢复外部改动
 function bindVideo(v) {
-  if (boundVideos.has(v)) return;
-  boundVideos.add(v);
+  if (!boundVideos.has(v)) {
+    boundVideos.add(v);
 
-  let fights = 0;
-  let giveUpUntil = 0;
-
-  v.addEventListener("ratechange", () => {
-    if (blocked) return;
-    if (Math.abs(v.playbackRate - currentRate) < 1e-6) return;
-    if (Date.now() < giveUpUntil) return;
-
-    fights++;
-    if (fights > FIGHT_LIMIT) {
-      fights = 0;
-      giveUpUntil = Date.now() + COOLDOWN;
-      return;
-    }
-    v.playbackRate = currentRate;
-  });
-
-  ["play", "loadeddata", "canplay"].forEach((evt) => {
-    v.addEventListener(evt, () => {
+    // 站点脚本 / 自动连播 / 长按加速改动速度时纠正回来
+    v.addEventListener("ratechange", () => {
       if (blocked) return;
-      if (Date.now() < giveUpUntil) return;
-      v.playbackRate = currentRate;
+      if (Math.abs(v.playbackRate - currentRate) < 1e-6) return;
+      if (!canWrite(v)) return;
+      setRate(v, currentRate);
     });
-  });
 
-  // 开启自动网页全屏时，视频开始播放即进入
-  v.addEventListener("play", () => maybeAutoFullscreen(v));
+    // 换源重新加载与起播阶段补一次，覆盖 ratechange 被限流的窗口
+    [
+      "play",
+      "playing",
+      "loadeddata",
+      "loadedmetadata",
+      "canplay",
+      "emptied",
+      "loadstart",
+      "seeking",
+    ].forEach((evt) => {
+      v.addEventListener(evt, () => {
+        if (blocked) return;
+        if (rateMatches(v, currentRate)) return;
+        if (!canWrite(v)) return;
+        setRate(v, currentRate);
+      });
+    });
+
+    // 开启自动网页全屏时，视频开始播放即进入
+    v.addEventListener("play", () => maybeAutoFullscreen(v));
+  }
+
+  if (!boundList.includes(v)) boundList.push(v);
 }
 
-// 将速度应用到所有视频
+// 将速度应用到所有视频（用户主动操作，不经过限流）
 function applySpeed(rate) {
   currentRate = rate;
   const videos = collectVideos(document);
   for (const v of videos) {
     bindVideo(v);
-    if (Math.abs(v.playbackRate - rate) > 1e-6) v.playbackRate = rate;
+    setRate(v, rate);
   }
   return videos.length;
 }
@@ -107,9 +214,28 @@ function bindNewVideos(videos) {
   for (const v of videos) {
     if (boundVideos.has(v)) continue;
     bindVideo(v);
-    if (!blocked) v.playbackRate = currentRate;
+    if (!blocked) setRate(v, currentRate);
   }
 }
+
+// 低频校对：兜住「事件被限流」或「站点重置后没抛事件」导致的掉速。
+// 这是对付复用同一个 <video> 的站点（抖音 feed、B 站、YouTube）最有效的一招。
+// 每 500ms 一次、只遍历已绑定且仍连接的少数 video，开销可忽略。
+// 校对是最后的兜底，不走 canWrite 限流（每个视频每秒最多 2 次，本身已很轻），
+// 这样即使站点高频重置把事件配额打满，最多 0.5s 后也一定能回到目标倍速。
+const SWEEP_INTERVAL = 500;
+setInterval(() => {
+  if (blocked) return;
+  for (let i = boundList.length - 1; i >= 0; i--) {
+    const v = boundList[i];
+    if (!v.isConnected) {
+      boundList.splice(i, 1);
+      continue;
+    }
+    if (rateMatches(v, currentRate)) continue;
+    setRate(v, currentRate);
+  }
+}, SWEEP_INTERVAL);
 
 // 收集单个新增节点（含自身）里的视频
 function collectFrom(el) {
@@ -146,18 +272,32 @@ function scheduleScan(mutations) {
     if (now - lastFullScan >= FULL_SCAN_INTERVAL) {
       lastFullScan = now;
       if (fsVideo && !fsVideo.isConnected) exitWebFullscreen();
+      // 保留待处理的增量节点：全量分支只做补充，不能把本轮新节点丢掉，
+      // 否则这些视频要等下一次 DOM 变动或 2.5s 后的全量扫描才有倍速
+      const added = pendingAdded;
       pendingAdded = [];
       const videos = collectVideos(document);
       knownVideos = videos;
       bindNewVideos(videos);
+      for (const el of added) {
+        const extra = collectFrom(el);
+        knownVideos.push(...extra);
+        bindNewVideos(extra);
+      }
       updateTrackBtn();
       return;
     }
     const added = pendingAdded;
     pendingAdded = [];
+    // 顺带清理已断开的旧节点，避免列表无限增长
+    if (knownVideos.length > 64) {
+      knownVideos = knownVideos.filter((v) => v.isConnected);
+    }
     for (const el of added) {
       const videos = collectFrom(el);
-      knownVideos.push(...videos);
+      for (const v of videos) {
+        if (!knownVideos.includes(v)) knownVideos.push(v);
+      }
       bindNewVideos(videos);
     }
     updateTrackBtn();
@@ -344,6 +484,9 @@ function enterWebFullscreen(v) {
 
   overlay.appendChild(buildFsUI(v));
 
+  // 节点被挪动后站点常会重建播放器并重置速度，这里主动补一次
+  if (!blocked) setRate(v, currentRate);
+
   updateTrackBtn();
 }
 
@@ -515,6 +658,8 @@ function exitWebFullscreen() {
     fsSavedParent = null;
     fsSavedNext = null;
     fsSavedControls = null;
+    // 还原到原位置后站点可能再次重置速度，补一次
+    if (!blocked && v.isConnected) setRate(v, currentRate);
     updateTrackBtn();
   }
 }
@@ -634,11 +779,14 @@ function refreshBlocked(callback) {
     { rate: 1.0, blocklist: DEFAULT_BLOCKLIST },
     ({ rate, blocklist }) => {
       if (seq !== refreshSeq) return;
-      setBlocklist(blocklist);
+      setBlocklist(migrateBlocklist(blocklist));
       const nowBlocked = isBlockedUrl(location.href);
       if (nowBlocked !== blocked) {
         blocked = nowBlocked;
         applySpeed(nowBlocked ? 1.0 : rate);
+      } else if (!blocked && Math.abs(currentRate - rate) > 1e-6) {
+        // URL 未变但倍速被改过（其他标签页/排除规则刷新），顺带同步
+        applySpeed(rate);
       }
       if (callback) callback();
     }
@@ -749,7 +897,8 @@ chrome.storage.onChanged.addListener((changes, area) => {
   chrome.storage.local.get(
     { rate: 1.0, blocklist: DEFAULT_BLOCKLIST, autoWebFullscreen: false },
     ({ rate, blocklist, autoWebFullscreen: autoFs }) => {
-      setBlocklist(blocklist);
+      const rules = migrateBlocklist(blocklist);
+      setBlocklist(rules);
       autoFullscreen = !!autoFs;
       blocked = isBlockedUrl(location.href);
       if (blocked) {
