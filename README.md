@@ -105,7 +105,7 @@
 
 ```bash
 node --check shared.js content.js content-main.js popup.js
-node --test tests/
+node --test tests/*.test.js
 ```
 
 CI 在 push / PR 时自动执行上述检查；打 `v*` tag 时校验 tag 与 manifest 版本一致并打包。

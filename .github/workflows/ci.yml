@@ -28,4 +28,4 @@ jobs:
           node -e "const fs = require('fs'), m = require('./manifest.json'); for (const p of Object.values(m.icons || {})) { if (!fs.existsSync(p)) throw new Error('missing icon: ' + p); }"
 
       - name: Unit tests
-        run: node --test tests/
+        run: node --test tests/*.test.js
