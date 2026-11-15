@@ -8,17 +8,15 @@ function showView(name) {
   if (name === "block") getBlocklist().then(renderBlocklist);
 }
 
-// 显示/隐藏排除提示，并给预设与滑块加视觉禁用态（仍可点击写入 storage）
+// 显示/隐藏排除提示。排除页仍然允许修改全局倍速（会影响其他页面），
+// 所以不做视觉禁用，避免「看起来不能点、实际能点」的误导。
 function setBlockedUI(blocked) {
   $("blocked").style.display = blocked ? "block" : "none";
-  document.querySelectorAll("#presets button").forEach((b) =>
-    b.classList.toggle("dim", blocked)
-  );
-  $("slider").classList.toggle("dim", blocked);
 }
 
 // 更新当前速度 UI（只处理数值与高亮，不涉及提示文案）
 function setCurrent(rate) {
+  rate = normalizeRate(rate);
   $("current").textContent = rate.toFixed(2) + "x";
   $("slider").value = rate;
   document.querySelectorAll("#presets button").forEach((b) => {
@@ -26,10 +24,14 @@ function setCurrent(rate) {
   });
 }
 
-// 提示文案：被排除时由 #blocked 横幅负责，这里只报视频数量
-function setTip(blocked, videoCount) {
+// 提示文案：被排除时由 #blocked 横幅负责；1x 未明确设置时提示不干预
+function setTip(blocked, videoCount, enforcing = true) {
   if (blocked) {
     $("tip").textContent = "";
+    return;
+  }
+  if (!enforcing) {
+    $("tip").textContent = "1x：不干预站点自己的倍速";
     return;
   }
   $("tip").textContent =
@@ -49,12 +51,16 @@ async function sendToTab(msg) {
 
 // 设置倍速并保存
 async function setSpeed(rate) {
-  chrome.storage.local.set({ rate });
+  rate = normalizeRate(rate);
+  try {
+    // rateExplicit 记录「用户明确选过倍速」：1x 也要强制，而不是默认的不干预
+    await chrome.storage.local.set({ rate, rateExplicit: true });
+  } catch {}
   setCurrent(rate);
   const res = await sendToTab({ type: "setSpeed", rate });
   if (res) {
     setBlockedUI(res.blocked);
-    setTip(res.blocked, res.count);
+    setTip(res.blocked, res.count, res.enforcing !== false);
   }
 }
 
@@ -117,33 +123,22 @@ $("backSpeed").addEventListener("click", () => showView("speed"));
 
 // 读取/保存排除列表
 async function getBlocklist() {
-  const { blocklist } = await chrome.storage.local.get({
+  const { blocklist, blocklistCustomized } = await chrome.storage.local.get({
     blocklist: DEFAULT_BLOCKLIST,
+    blocklistCustomized: false,
   });
   // 与内容脚本一致地升级历史默认表，避免弹窗显示旧规则
-  return migrateBlocklist(blocklist);
+  return migrateBlocklist(blocklist, blocklistCustomized);
 }
 
 async function saveBlocklist(list) {
-  await chrome.storage.local.set({ blocklist: list });
+  // 用户编辑过之后固定打上 customized 标志：哪怕列表恰好等于历史默认表，
+  // 也不会再被迁移逻辑覆盖
+  await chrome.storage.local.set({
+    blocklist: list,
+    blocklistCustomized: true,
+  });
   renderBlocklist(list);
-  notifyAllTabs();
-}
-
-// 通知所有标签页重新检查排除规则
-async function notifyAllTabs() {
-  let tabs;
-  try {
-    // 只查能注入 content script 的页面，跳过 chrome:// 等无效目标
-    tabs = await chrome.tabs.query({ url: ["http://*/*", "https://*/*"] });
-  } catch {
-    tabs = await chrome.tabs.query({});
-  }
-  await Promise.allSettled(
-    tabs
-      .filter((t) => t.id != null)
-      .map((t) => chrome.tabs.sendMessage(t.id, { type: "checkBlock" }))
-  );
 }
 
 // 渲染排除规则列表
@@ -200,11 +195,12 @@ $("input").addEventListener("keydown", (e) => {
   const res = await sendToTab({ type: "getSpeed" });
   if (res) {
     setBlockedUI(res.blocked);
-    setCurrent(res.blocked ? 1.0 : res.rate);
-    setTip(res.blocked, res.count);
+    // 排除页显示保存的倍速（本页实际不会生效），而不是伪装成 1x
+    setCurrent(res.blocked ? rate : res.rate);
+    setTip(res.blocked, res.count, res.enforcing !== false);
     setWebFullscreenUI(!!res.webFullscreen);
   } else {
     // 页面不可注入时 sendToTab 已提示「此页面不可用，刷新后重试」，此处不再覆盖
-    setCurrent(rate);
+    setCurrent(normalizeRate(rate));
   }
 })();

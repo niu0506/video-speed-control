@@ -15,11 +15,25 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Validate
+        run: |
+          for f in shared.js content.js content-main.js popup.js; do
+            node --check "$f"
+          done
+          node -e "JSON.parse(require('fs').readFileSync('manifest.json', 'utf8'))"
+          node -e "const fs = require('fs'), m = require('./manifest.json'); for (const p of Object.values(m.icons || {})) { if (!fs.existsSync(p)) throw new Error('missing icon: ' + p); }"
+          node -e "const v = require('./manifest.json').version; if (process.env.GITHUB_REF_NAME !== 'v' + v) { console.error('tag ' + process.env.GITHUB_REF_NAME + ' does not match manifest version v' + v); process.exit(1); }"
+
       - name: Package extension
         run: |
           mkdir -p dist
           zip -r "dist/video-speed-control-${{ github.ref_name }}.zip" \
-            manifest.json shared.js content.js content-main.js popup.html popup.js
+            manifest.json shared.js content.js content-main.js popup.html popup.js icons
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

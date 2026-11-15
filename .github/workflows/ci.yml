@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Syntax check
+        run: |
+          for f in shared.js content.js content-main.js popup.js tests/shared.test.js; do
+            node --check "$f"
+          done
+          node -e "JSON.parse(require('fs').readFileSync('manifest.json', 'utf8'))"
+          node -e "const fs = require('fs'), m = require('./manifest.json'); for (const p of Object.values(m.icons || {})) { if (!fs.existsSync(p)) throw new Error('missing icon: ' + p); }"
+
+      - name: Unit tests
+        run: node --test tests/

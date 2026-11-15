@@ -2,6 +2,12 @@
 let currentRate = 1.0;
 let blocked = false;
 let autoFullscreen = false;
+// 用户是否明确选过倍速。1x 默认不干预页面；明确选过 1x 才强制 1x。
+let rateExplicit = false;
+// init 的 storage 读取完成前，不放行 onChanged，避免 blocked 还没算出来就先应用倍速
+let initialized = false;
+// 自动全屏去重：按视频源记录，换源后允许再次触发（WeakMap 不阻止 GC）
+const autoDoneSrc = new WeakMap();
 
 // 默认排除表与迁移逻辑见 shared.js（与 popup 共用，避免两处漂移）
 
@@ -38,7 +44,8 @@ function isBlockedUrl(url) {
   } catch {
     return compiledRules.some((r) => r.re.test(url));
   }
-  const host = u.hostname.toLowerCase();
+  // 用 host（含端口）而不是 hostname：`//localhost:3000` 这类规则才能命中
+  const host = u.host.toLowerCase();
   // 两套候选串：带协议（给 `//live\.` 这类域名/URL 规则用）与不带（给路径、参数规则用）。
   // 非 full 规则只测 shortTarget，避免 `live` 这类短词又误命中 `alive.com`。
   const fullTarget = u.protocol + "//" + host + u.pathname + u.search;
@@ -85,9 +92,6 @@ const boundList = [];
 // 每个视频的写入时间戳，用于限流
 const writeLogs = new WeakMap();
 
-// 正在由本扩展写速的视频：避免自己写的值又触发 ratechange 造成自锁/重复计数
-const writing = new WeakSet();
-
 // 限流：同一视频在 WRITE_WINDOW 内最多写 limit 次；超出则跳过本次
 function canWriteWithin(v, limit) {
   const now = Date.now();
@@ -108,25 +112,27 @@ function canWrite(v) {
 }
 
 // 同时写 defaultPlaybackRate：媒体重新加载（换 src / load()）时浏览器会把
-// playbackRate 重置成 defaultPlaybackRate，只写 playbackRate 会被打回 1x
-// 写入时打上透传标记：主世界的 setter 拦截器会放行扩展自己的写入。
+// playbackRate 重置成 defaultPlaybackRate，只写 playbackRate 会被打回 1x。
+// 注意：隔离世界有自己的 DOM 原型链，本扩展的写入走原生 setter，
+// 不会经过主世界被改写的 setter，因此不需要任何「透传」标记。
 function setRate(v, rate) {
-  if (writing.has(v)) return;
-  writing.add(v);
+  const next = normalizeRate(rate, 1);
   try {
-    v.__vsc_passthrough__ = true;
-    if (Math.abs(v.defaultPlaybackRate - rate) > 1e-6) {
-      v.defaultPlaybackRate = rate;
+    if (Math.abs(v.defaultPlaybackRate - next) > 1e-6) {
+      v.defaultPlaybackRate = next;
     }
-    if (Math.abs(v.playbackRate - rate) > 1e-6) v.playbackRate = rate;
+    if (Math.abs(v.playbackRate - next) > 1e-6) v.playbackRate = next;
   } catch {
     // 视频已进入不可写状态（如被移除），忽略
-  } finally {
-    try {
-      v.__vsc_passthrough__ = false;
-    } catch {}
-    writing.delete(v);
   }
+}
+
+// 是否应该主动干预页面：
+// - 被排除的页面完全不干预；
+// - 1x 在用户没有明确选过倍速时保持「不干预」，避免装完扩展就把站点自己的
+//   1.5x/2x 压回 1x；在弹窗里明确选择 1x 后 rateExplicit=true，才会强制 1x。
+function shouldEnforce() {
+  return !blocked && (rateExplicit || Math.abs(currentRate - 1) > 1e-6);
 }
 
 // 把目标倍速同步给主世界拦截器；enabled=false 时它完全不干预页面
@@ -134,7 +140,7 @@ function syncMainWorld() {
   try {
     document.dispatchEvent(
       new CustomEvent("__vsc_set_rate__", {
-        detail: { rate: currentRate, enabled: !blocked },
+        detail: { rate: currentRate, enabled: shouldEnforce() },
       })
     );
   } catch {}
@@ -156,7 +162,7 @@ function bindVideo(v) {
     // 站点脚本 / 自动连播 / 长按加速改动速度时纠正回来。
     // 若视频正在播放，直接拉起逐帧守护，让站点的重置只生效一帧。
     v.addEventListener("ratechange", () => {
-      if (blocked) return;
+      if (!shouldEnforce()) return;
       if (Math.abs(v.playbackRate - currentRate) < 1e-6) return;
       if (!canWrite(v)) return;
       setRate(v, currentRate);
@@ -175,7 +181,8 @@ function bindVideo(v) {
       "seeking",
     ].forEach((evt) => {
       v.addEventListener(evt, () => {
-        if (blocked) return;
+        if (!shouldEnforce()) return;
+        keeperFails.delete(v);
         if (!rateMatches(v, currentRate) && canWrite(v)) {
           setRate(v, currentRate);
         }
@@ -184,24 +191,56 @@ function bindVideo(v) {
       });
     });
 
+    // 复用同一个 <video> 换源时，清除“已自动全屏过”的标记，让下一个视频能再次触发
+    ["emptied", "loadstart"].forEach((evt) => {
+      v.addEventListener(evt, () => autoDoneSrc.delete(v));
+    });
+
     // 开启自动网页全屏时，视频开始播放即进入
     v.addEventListener("play", () => maybeAutoFullscreen(v));
   }
 
   if (!boundList.includes(v)) boundList.push(v);
+
+  // 主世界拦截器只处理带这个属性的 <video>（不影响 <audio> 等媒体元素）。
+  // DOM 属性跨世界可见，这是隔离世界与主世界之间最稳的标记方式；
+  // 每次 bind 都检查一次，防止站点重渲染时把属性清掉。
+  if (!v.hasAttribute("data-vsc-managed")) {
+    try {
+      v.setAttribute("data-vsc-managed", "1");
+    } catch {}
+  }
+
+  // 绑定前就已经在播放的视频不会再有 play 事件，这里补一次自动全屏判断
+  if (!v.paused && !v.ended) maybeAutoFullscreen(v);
 }
 
-// 将速度应用到所有视频（用户主动操作，不经过限流）
-function applySpeed(rate) {
-  currentRate = rate;
+// 改速时遍历的视频：首次（boundList 为空）用全量扫描发现 Shadow DOM；
+// 之后复用已绑定列表 + light DOM 查询，避免每次改速都 querySelectorAll("*")。
+function videosForApply() {
+  const connected = boundList.filter((v) => v.isConnected);
+  if (!connected.length) return collectVideos(document);
+  const set = new Set(connected);
+  for (const v of document.querySelectorAll("video")) set.add(v);
+  return Array.from(set);
+}
+
+// 将速度应用到所有视频。
+// restore=true 用于被排除的页面：只负责把之前改过的速度还原成 1x，不启用守护。
+function applySpeed(rate, restore = false) {
+  currentRate = normalizeRate(rate, 1);
+  const write = restore || shouldEnforce();
   syncMainWorld();
-  const videos = collectVideos(document);
+  const videos = videosForApply();
   for (const v of videos) {
     bindVideo(v);
-    setRate(v, rate);
+    if (write) {
+      keeperFails.delete(v);
+      setRate(v, currentRate);
+    }
   }
   // 用户改速后立即拉起守护，压制站点随后可能的重置
-  if (videos.some((v) => !v.paused && !v.ended)) startKeeper();
+  if (write && videos.some((v) => !v.paused && !v.ended)) startKeeper();
   return videos.length;
 }
 
@@ -210,7 +249,7 @@ function bindNewVideos(videos) {
   for (const v of videos) {
     if (boundVideos.has(v)) continue;
     bindVideo(v);
-    if (!blocked) setRate(v, currentRate);
+    if (shouldEnforce()) setRate(v, currentRate);
   }
 }
 
@@ -226,6 +265,12 @@ function bindNewVideos(videos) {
 // 守护写入的每秒上限：既压住真正的 ping-pong，又远高于站点的重置频率
 const KEEP_LIMIT = 30;
 
+// 连续写不进去时的退避：约 1 秒仍未达到目标就冷却 3 秒再试，
+// 避免浏览器钳制/异常站点让 rAF 永久以 60Hz 空转。
+const KEEP_FAIL_LIMIT = 60;
+const KEEP_COOLDOWN = 3000;
+const keeperFails = new WeakMap();
+
 // 强制写回目标倍速（守护路径，限额放宽到 KEEP_LIMIT）
 function forceRate(v) {
   if (!canWriteWithin(v, KEEP_LIMIT)) return false;
@@ -236,7 +281,7 @@ function forceRate(v) {
 let keeperRunning = false;
 
 function keepTick() {
-  if (blocked) {
+  if (!shouldEnforce()) {
     keeperRunning = false;
     return;
   }
@@ -246,8 +291,26 @@ function keepTick() {
     if (!v.isConnected) continue;
     if (v.paused || v.ended) continue;
     anyPlaying = true;
-    if (rateMatches(v, currentRate)) continue;
-    forceRate(v);
+    if (rateMatches(v, currentRate)) {
+      keeperFails.delete(v);
+      continue;
+    }
+
+    const now = Date.now();
+    const st = keeperFails.get(v);
+    if (st && st.until > now) continue; // 冷却中
+    if (st && st.until && st.until <= now) keeperFails.delete(v);
+
+    if (!forceRate(v)) continue;
+    if (rateMatches(v, currentRate)) {
+      keeperFails.delete(v);
+      continue;
+    }
+    const n = (st && st.until === 0 ? st.n : 0) + 1;
+    keeperFails.set(v, {
+      n,
+      until: n >= KEEP_FAIL_LIMIT ? now + KEEP_COOLDOWN : 0,
+    });
   }
   if (anyPlaying) {
     requestAnimationFrame(keepTick);
@@ -258,7 +321,7 @@ function keepTick() {
 
 // 启动守护：有视频在播时才跑
 function startKeeper() {
-  if (blocked || keeperRunning) return;
+  if (!shouldEnforce() || keeperRunning) return;
   keeperRunning = true;
   requestAnimationFrame(keepTick);
 }
@@ -272,17 +335,15 @@ function startKeeper() {
     (e) => {
       const v = e.target;
       if (!(v instanceof HTMLMediaElement)) return;
-      if (blocked) return;
-      if (!boundVideos.has(v)) {
-        bindVideo(v);
+      // 1x 不干预 / 排除页也保持绑定，但只有需要强制时才写速
+      if (!boundVideos.has(v)) bindVideo(v);
+      if (!shouldEnforce()) return;
+      // 自己的写速也会触发 ratechange，不能让它清掉退避计数
+      if (evt !== "ratechange") keeperFails.delete(v);
+      if (!rateMatches(v, currentRate) && canWrite(v)) {
         setRate(v, currentRate);
       }
-      if (!v.paused && !v.ended) {
-        if (!rateMatches(v, currentRate) && canWrite(v)) {
-          setRate(v, currentRate);
-        }
-        startKeeper();
-      }
+      if (!v.paused && !v.ended) startKeeper();
     },
     true
   );
@@ -291,7 +352,6 @@ function startKeeper() {
 // 低频兜底扫描：清理断开节点，并给「没抛 play 事件」的视频也接上守护
 const SWEEP_INTERVAL = 2000;
 setInterval(() => {
-  if (blocked) return;
   let anyPlaying = false;
   for (let i = boundList.length - 1; i >= 0; i--) {
     const v = boundList[i];
@@ -300,11 +360,12 @@ setInterval(() => {
       continue;
     }
     if (!v.paused && !v.ended) anyPlaying = true;
+    if (!shouldEnforce()) continue;
     if (rateMatches(v, currentRate)) continue;
     if (!canWriteWithin(v, WRITE_LIMIT)) continue;
     setRate(v, currentRate);
   }
-  if (anyPlaying) startKeeper();
+  if (anyPlaying && shouldEnforce()) startKeeper();
 }, SWEEP_INTERVAL);
 
 // 收集单个新增节点（含自身）里的视频
@@ -320,7 +381,7 @@ function collectFrom(el) {
 }
 
 // 延迟扫描：优先增量（只扫本次新增节点），低频全量兜底（捕获晚挂载的 shadow root）
-const FULL_SCAN_INTERVAL = 2500;
+const FULL_SCAN_INTERVAL = 5000;
 let scanTimer = null;
 let pendingAdded = [];
 let lastFullScan = 0;
@@ -339,6 +400,8 @@ function scheduleScan(mutations) {
     const now = Date.now();
     if (now - lastFullScan >= FULL_SCAN_INTERVAL) {
       lastFullScan = now;
+      // 后台标签页不做全页遍历；保留 pendingAdded，等可见后再处理
+      if (document.hidden) return;
       if (fsVideo && !fsVideo.isConnected) exitWebFullscreen();
       // 全量扫描覆盖整棵文档树（含已发现的 shadow root），
       // 新节点也已包含在内，无需再单独处理 pendingAdded
@@ -354,6 +417,11 @@ function scheduleScan(mutations) {
   }, 100);
 }
 
+// 从后台切回前台时补一次扫描，处理隐藏期间积压的节点
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) scheduleScan();
+});
+
 // ===== 网页全屏：视频铺满浏览器窗口，隐藏页面其他所有内容 =====
 let fsVideo = null;
 let fsOverlay = null;
@@ -364,11 +432,16 @@ let fsSavedControls = null;
 let fsUIHandlers = null;
 let fsWheelHandler = null;
 
-// 选择目标视频：优先正在播放的
+// 选择目标视频：优先正在播放且实际有布局尺寸的
+function hasBox(v) {
+  const r = v.getBoundingClientRect();
+  return r.width > 1 && r.height > 1;
+}
+
 function pickVideo() {
   let fallback = null;
   for (const v of boundList) {
-    if (!v.isConnected) continue;
+    if (!v.isConnected || !hasBox(v)) continue;
     if (!v.paused && !v.ended) return v;
     if (!fallback) fallback = v;
   }
@@ -376,7 +449,11 @@ function pickVideo() {
   // 兜底：列表还空（页面刚打开、尚未扫描到视频）时做一次扫描并绑定
   const videos = collectVideos(document);
   videos.forEach(bindVideo);
-  return videos.find((v) => !v.paused && !v.ended) || videos[0] || null;
+  return (
+    videos.find((v) => hasBox(v) && !v.paused && !v.ended) ||
+    videos.find((v) => hasBox(v)) ||
+    null
+  );
 }
 
 // 注入一次全局样式（按钮 + 全屏遮罩，全部 !important 防止被页面 CSS 覆盖）
@@ -544,7 +621,7 @@ function enterWebFullscreen(v) {
   overlay.appendChild(buildFsUI(v));
 
   // 节点被挪动后站点常会重建播放器并重置速度，这里主动补一次
-  if (!blocked) setRate(v, currentRate);
+  if (shouldEnforce()) setRate(v, currentRate);
 
   updateTrackBtn();
 }
@@ -567,6 +644,10 @@ function buildFsUI(v) {
   const play = document.createElement("div");
   play.className = "vsc-btn vsc-play";
 
+  const mute = document.createElement("div");
+  mute.className = "vsc-btn vsc-mute";
+  mute.title = "静音 (m)";
+
   const cur = document.createElement("div");
   cur.className = "vsc-time";
 
@@ -587,13 +668,17 @@ function buildFsUI(v) {
   exit.className = "vsc-btn vsc-exit";
   exit.textContent = "退出全屏";
 
-  bar.append(play, cur, track, dur, exit);
+  bar.append(play, mute, cur, track, dur, exit);
 
   const ratio = () =>
     isFinite(v.duration) && v.duration > 0 ? v.currentTime / v.duration : 0;
 
   const syncPlay = () => {
     play.textContent = v.paused ? "▶" : "❚❚";
+  };
+
+  const syncMute = () => {
+    mute.textContent = v.muted || v.volume === 0 ? "🔇" : "🔊";
   };
 
   const syncProgress = () => {
@@ -644,8 +729,18 @@ function buildFsUI(v) {
 
   play.addEventListener("click", (e) => {
     e.stopPropagation();
-    if (v.paused) v.play();
+    if (v.paused) v.play().catch(() => {});
     else v.pause();
+  });
+  mute.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (v.muted || v.volume === 0) {
+      v.muted = false;
+      if (v.volume === 0) v.volume = 0.5;
+    } else {
+      v.muted = true;
+    }
+    syncMute();
   });
   exit.addEventListener("click", (e) => {
     e.stopPropagation();
@@ -658,11 +753,13 @@ function buildFsUI(v) {
   ["play", "pause"].forEach((t) => v.addEventListener(t, syncPlay));
   v.addEventListener("timeupdate", syncProgress);
   v.addEventListener("progress", syncProgress);
+  v.addEventListener("volumechange", syncMute);
 
   // 记录监听器，退出时解绑
-  fsUIHandlers = { v, syncPlay, syncProgress };
+  fsUIHandlers = { v, syncPlay, syncProgress, syncMute };
 
   syncPlay();
+  syncMute();
   syncProgress();
   return bar;
 }
@@ -674,13 +771,14 @@ function exitWebFullscreen() {
   fsVideo = null;
 
   if (fsUIHandlers) {
-    const { v: sv, syncPlay, syncProgress } = fsUIHandlers;
+    const { v: sv, syncPlay, syncProgress, syncMute } = fsUIHandlers;
     sv.removeEventListener("timeupdate", syncProgress);
     sv.removeEventListener("progress", syncProgress);
     ["play", "pause", "loadedmetadata", "durationchange", "seeked"].forEach(
       (t) => sv.removeEventListener(t, syncProgress)
     );
     ["play", "pause"].forEach((t) => sv.removeEventListener(t, syncPlay));
+    sv.removeEventListener("volumechange", syncMute);
     fsUIHandlers = null;
   }
 
@@ -718,7 +816,7 @@ function exitWebFullscreen() {
     fsSavedNext = null;
     fsSavedControls = null;
     // 还原到原位置后站点可能再次重置速度，补一次
-    if (!blocked && v.isConnected) setRate(v, currentRate);
+    if (shouldEnforce() && v.isConnected) setRate(v, currentRate);
     updateTrackBtn();
   }
 }
@@ -731,8 +829,12 @@ function toggleWebFullscreen() {
   }
   // 优先使用悬浮按钮当前定位到的视频，保证与用户看到的那个一致
   const v =
-    trackedVideo && trackedVideo.isConnected ? trackedVideo : pickVideo();
+    trackedVideo && trackedVideo.isConnected && hasBox(trackedVideo)
+      ? trackedVideo
+      : pickVideo();
   if (!v) return null;
+  // pickVideo 内部的 bindVideo 可能已经触发自动全屏，避免重复进入
+  if (fsVideo) return true;
   enterWebFullscreen(v);
   return true;
 }
@@ -741,6 +843,9 @@ function toggleWebFullscreen() {
 // 不塞进播放器内部，避免被 YouTube 等站点的 Shadow DOM / overflow / 覆盖层裁掉
 let trackBtn = null;
 let trackedVideo = null;
+let lastBtnLeft = null;
+let lastBtnTop = null;
+let lastBtnVisible = false;
 
 // 挑选当前最值得操作的视频：可见、面积大、正在播放的优先
 // 复用 boundList（所有绑定过的视频），避免每次定位都全页遍历
@@ -778,52 +883,124 @@ function ensureTrackBtn() {
   btn.addEventListener("click", (e) => {
     e.stopPropagation();
     e.preventDefault();
-    if (fsVideo) {
-      exitWebFullscreen();
-    } else if (trackedVideo) {
-      enterWebFullscreen(trackedVideo);
-    }
+    toggleWebFullscreen();
   });
   document.documentElement.appendChild(btn);
   trackBtn = btn;
+  lastBtnVisible = false;
+  lastBtnLeft = null;
+  lastBtnTop = null;
+}
+
+// 只在可见状态/坐标真正变化时写 style，减少滚动时的 layout/style 抖动
+function setTrackBtnVisible(visible) {
+  if (!trackBtn || lastBtnVisible === visible) return;
+  lastBtnVisible = visible;
+  trackBtn.style.display = visible ? "flex" : "none";
 }
 
 // 让按钮跟随视频右下角（位于控制栏上方，避免遮挡原生按钮）
 function updateTrackBtn() {
   if (!isTop) return;
-  ensureTrackBtn();
-
-  if (fsVideo || !trackBtn) {
-    trackBtn.style.display = "none";
+  if (fsVideo) {
+    setTrackBtnVisible(false);
     return;
   }
 
   const v = pickTrackedVideo();
   trackedVideo = v;
   if (!v) {
-    trackBtn.style.display = "none";
+    setTrackBtnVisible(false);
     return;
   }
 
+  ensureTrackBtn();
+  if (!trackBtn) return;
+
   const r = v.getBoundingClientRect();
-  trackBtn.style.display = "flex";
-  trackBtn.style.left = r.left + r.width - 44 + "px";
-  trackBtn.style.top = r.bottom - 86 + "px";
+  const left = r.left + r.width - 44;
+  const top = r.bottom - 86;
+  if (left !== lastBtnLeft || top !== lastBtnTop) {
+    lastBtnLeft = left;
+    lastBtnTop = top;
+    trackBtn.style.left = left + "px";
+    trackBtn.style.top = top + "px";
+  }
+  setTrackBtnVisible(true);
 }
 
-// 滚动/缩放/定时刷新按钮位置
-window.addEventListener("scroll", updateTrackBtn, true);
-window.addEventListener("resize", updateTrackBtn);
-setInterval(updateTrackBtn, 300);
+// 滚动/缩放/定时刷新按钮位置：用 rAF 合并，避免每个 scroll 事件都重新测量
+let trackRaf = 0;
+function scheduleTrackBtn() {
+  if (!isTop || trackRaf) return;
+  trackRaf = requestAnimationFrame(() => {
+    trackRaf = 0;
+    updateTrackBtn();
+  });
+}
 
-// Esc 退出网页全屏（capture 阶段优先于网站自身的按键处理）
+window.addEventListener("scroll", scheduleTrackBtn, true);
+window.addEventListener("resize", scheduleTrackBtn);
+setInterval(scheduleTrackBtn, 300);
+
+// 网页全屏下的键盘快捷键（capture 阶段优先于网站自身的按键处理）
 document.addEventListener(
   "keydown",
   (e) => {
-    if (e.key === "Escape" && fsVideo) {
+    if (!fsVideo) return;
+    if (e.key === "Escape") {
       e.preventDefault();
       e.stopImmediatePropagation();
       exitWebFullscreen();
+      return;
+    }
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    const t = e.target;
+    if (
+      t &&
+      (t.tagName === "INPUT" ||
+        t.tagName === "TEXTAREA" ||
+        t.tagName === "SELECT" ||
+        t.isContentEditable)
+    ) {
+      return;
+    }
+
+    const v = fsVideo;
+    let handled = true;
+    switch (e.key) {
+      case " ":
+      case "Spacebar":
+      case "k":
+      case "K":
+        if (v.paused) v.play().catch(() => {});
+        else v.pause();
+        break;
+      case "ArrowLeft":
+        v.currentTime = Math.max(0, v.currentTime - 5);
+        break;
+      case "ArrowRight":
+        v.currentTime = Math.min(
+          isFinite(v.duration) && v.duration > 0 ? v.duration : Infinity,
+          v.currentTime + 5
+        );
+        break;
+      case "ArrowUp":
+        v.volume = Math.min(1, Math.round((v.volume + 0.05) * 100) / 100);
+        break;
+      case "ArrowDown":
+        v.volume = Math.max(0, Math.round((v.volume - 0.05) * 100) / 100);
+        break;
+      case "m":
+      case "M":
+        v.muted = !v.muted;
+        break;
+      default:
+        handled = false;
+    }
+    if (handled) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
     }
   },
   true
@@ -832,23 +1009,29 @@ document.addEventListener(
 // 请求序号：丢弃过期的 storage 读取结果
 let refreshSeq = 0;
 
-// 重算排除状态，必要时切换速度；状态确定后调用 callback
-function refreshBlocked(callback) {
+// 重算排除状态，必要时切换速度
+function refreshBlocked() {
+  // init 还没完成时直接忽略：init 自己会按当前 URL 计算 blocked 并应用
+  if (!initialized) return;
   const seq = ++refreshSeq;
   chrome.storage.local.get(
-    { rate: 1.0, blocklist: DEFAULT_BLOCKLIST },
-    ({ rate, blocklist }) => {
+    {
+      rate: 1.0,
+      blocklist: DEFAULT_BLOCKLIST,
+      blocklistCustomized: false,
+    },
+    ({ rate, blocklist, blocklistCustomized: customized }) => {
       if (seq !== refreshSeq) return;
-      setBlocklist(migrateBlocklist(blocklist));
+      setBlocklist(migrateBlocklist(blocklist, customized));
       const nowBlocked = isBlockedUrl(location.href);
       if (nowBlocked !== blocked) {
         blocked = nowBlocked;
-        applySpeed(nowBlocked ? 1.0 : rate);
+        // 被排除时把之前改过的速度还原成 1x，但不再启用拦截
+        applySpeed(nowBlocked ? 1.0 : rate, nowBlocked);
       } else if (!blocked && Math.abs(currentRate - rate) > 1e-6) {
         // URL 未变但倍速被改过（其他标签页/排除规则刷新），顺带同步
         applySpeed(rate);
       }
-      if (callback) callback();
     }
   );
 }
@@ -881,11 +1064,15 @@ const isTop = (() => {
 // 接收弹窗消息
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === "setSpeed") {
+    // 从弹窗点选倍速属于明确操作；1x 也要强制，因此置位 rateExplicit
+    rateExplicit = true;
     if (blocked) {
       if (isTop) sendResponse({ count: 0, blocked: true });
     } else {
       const count = applySpeed(msg.rate);
-      if (isTop) sendResponse({ count, blocked: false });
+      if (isTop) {
+        sendResponse({ count, blocked: false, enforcing: shouldEnforce() });
+      }
     }
   } else if (msg.type === "getSpeed") {
     if (isTop) {
@@ -894,6 +1081,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         count: boundList.filter((v) => v.isConnected).length,
         blocked,
         webFullscreen: !!fsVideo,
+        enforcing: shouldEnforce(),
       });
     }
   } else if (msg.type === "toggleWebFullscreen") {
@@ -905,49 +1093,70 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           : { found: true, webFullscreen: result }
       );
     }
-  } else if (msg.type === "checkBlock") {
-    refreshBlocked(isTop ? () => sendResponse({ blocked }) : null);
-    return isTop; // 顶层需保持消息通道等待异步回复
   }
   return false;
 });
 
-// 自动网页全屏：已触发过的视频不再重复进入
-const autoDone = new WeakSet();
-
+// 自动网页全屏：按“视频源”去重，同一个 <video> 换源后可以再次触发；
+// 同一个视频手动退出后不再自动进入。
 function maybeAutoFullscreen(v) {
   if (!isTop || !autoFullscreen || blocked || fsVideo) return;
-  if (autoDone.has(v)) return;
+
+  const src = v.currentSrc || v.src || "";
+  if (autoDoneSrc.has(v) && autoDoneSrc.get(v) === src) return;
 
   const fits = () => {
     const r = v.getBoundingClientRect();
     return r.width >= 400 && r.height >= 200;
   };
 
+  const mark = () => autoDoneSrc.set(v, src);
+
   if (fits()) {
-    autoDone.add(v);
+    mark();
     enterWebFullscreen(v);
     return;
   }
   // 尺寸暂不满足（可能尚未完成布局），稍后重新检查一次，仍不满足则放弃
   setTimeout(() => {
     if (!isTop || !autoFullscreen || blocked || fsVideo) return;
-    if (autoDone.has(v) || !v.isConnected) return;
+    if (!v.isConnected) return;
+    // 源已换掉（feed 复用同一个元素）就不要为旧源进入全屏
+    if ((v.currentSrc || v.src || "") !== src) return;
+    if (autoDoneSrc.has(v) && autoDoneSrc.get(v) === src) return;
     if (!fits()) return;
-    autoDone.add(v);
+    mark();
     enterWebFullscreen(v);
   }, 300);
 }
 
-// 开关/倍速变化时立即生效，无需刷新页面
+// 开关/倍速/排除规则变化时立即生效，无需刷新页面
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "local") return;
+  // init 还没算出 blocked 时先忽略，避免被排除页面在初始化前被应用倍速
+  if (!initialized) return;
   if (changes.autoWebFullscreen) {
     autoFullscreen = !!changes.autoWebFullscreen.newValue;
+    if (autoFullscreen) {
+      // 打开开关时，已经处于播放中的视频也应立即进入
+      for (const v of boundList) {
+        if (v.isConnected && !v.paused && !v.ended) maybeAutoFullscreen(v);
+      }
+    }
   }
-  // 其他标签页改变倍速时同步；被排除页面忽略
+  // 先更新「用户是否明确设置过」，再统一应用一次倍速，避免同一次 storage 变更
+  // 同时带 rate 和 rateExplicit 时触发两轮全量扫描
+  if (changes.rateExplicit) {
+    rateExplicit = !!changes.rateExplicit.newValue;
+  }
   if (changes.rate && !blocked) {
     applySpeed(changes.rate.newValue);
+  } else if (changes.rateExplicit && !blocked) {
+    applySpeed(currentRate);
+  }
+  // 排除规则由 storage 事件驱动，所有 frame 都会收到，无需 popup 逐个 tab 发消息
+  if (changes.blocklist || changes.blocklistCustomized) {
+    refreshBlocked();
   }
 });
 
@@ -955,9 +1164,22 @@ chrome.storage.onChanged.addListener((changes, area) => {
 (function init() {
   observeRoot(document.documentElement);
   chrome.storage.local.get(
-    { rate: 1.0, blocklist: DEFAULT_BLOCKLIST, autoWebFullscreen: false },
-    ({ rate, blocklist, autoWebFullscreen: autoFs }) => {
-      const rules = migrateBlocklist(blocklist);
+    {
+      rate: 1.0,
+      blocklist: DEFAULT_BLOCKLIST,
+      autoWebFullscreen: false,
+      rateExplicit: false,
+      blocklistCustomized: false,
+    },
+    ({
+      rate,
+      blocklist,
+      autoWebFullscreen: autoFs,
+      rateExplicit: explicit,
+      blocklistCustomized: customized,
+    }) => {
+      rateExplicit = !!explicit;
+      const rules = migrateBlocklist(blocklist, customized);
       setBlocklist(rules);
       autoFullscreen = !!autoFs;
       blocked = isBlockedUrl(location.href);
@@ -966,9 +1188,11 @@ chrome.storage.onChanged.addListener((changes, area) => {
       if (blocked) {
         collectVideos(document).forEach(bindVideo);
       } else {
+        // 1x 且用户没有明确设置过时，applySpeed 不会写视频，只完成绑定
         applySpeed(rate);
       }
       updateTrackBtn();
+      initialized = true;
     }
   );
 })();

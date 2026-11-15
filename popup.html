@@ -83,8 +83,6 @@
       text-align: center;
       margin-top: 4px;
     }
-    /* 排除页面上预设与滑块的视觉禁用态（仍可点击写入 storage） */
-    .dim { opacity: .45; }
     /* 排除网站视图 */
     .desc { color: #8888a8; font-size: 11px; line-height: 1.6; margin: 0 0 10px; }
     .desc code { color: #7c9cff; }
@@ -161,7 +159,7 @@
     <input type="range" id="slider" min="0.25" max="16" step="0.25" />
     <button class="wfs" id="webFullscreen">网页全屏</button>
     <button class="toggle" id="autoFs">自动网页全屏播放：关</button>
-    <div class="blocked" id="blocked" style="display:none">⚠ 此页面在排除列表中</div>
+    <div class="blocked" id="blocked" style="display:none">⚠ 此页面在排除列表中：本页按站点自身倍速，修改倍速会影响其他页面</div>
     <div class="tip" id="tip"></div>
     <span class="settings" id="openOptions">排除网站设置</span>
   </div>

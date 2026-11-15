@@ -8,17 +8,19 @@
 
 - **快捷调速**：预设 0.5x / 1x / 1.5x / 2x / 3x / 4x / 8x / 16x 按钮，也可用滑块精确调节（步进 0.25）
 - **自动应用**：速度设置会保存，新页面、新视频、SPA 路由跳转后自动生效
-- **全页面生效**：注入所有 http/https 页面（含 iframe），支持穿透 Shadow DOM
-- **对抗外部改速**：在主世界拦截 `playbackRate` 写入，站点把速度改回 1x 的写入会被直接改写成目标倍速；同时写入 `defaultPlaybackRate`，换源重新加载后也不会被打回 1x
+- **全页面生效**：注入所有 http/https 页面（含 iframe），支持穿透 open Shadow DOM
+- **对抗外部改速**：在主世界拦截受管 `<video>` 的 `playbackRate` 写入，站点把速度改回 1x 的写入会被直接改写成目标倍速；同时写入 `defaultPlaybackRate`，换源重新加载后也不会被打回 1x。只影响 `<video>`，不会碰 `<audio>` 等媒体元素
+- **1x 不打扰**：默认 1x 时不干预页面（尊重站点自己的倍速）；在面板中明确选择 1x 后才会强制 1x
 - **排除网站**：按正则匹配页面地址（域名 + 路径 + 查询串），命中规则的页面不会被加速
 
 ### 网页全屏
 
 - **视频上的全屏按钮**：视频可见时，其右下角会出现一个全屏图标按钮，点击即进入网页全屏
 - **铺满窗口、隐藏页面 UI**：视频被移入全屏遮罩层，页面其他内容全部被盖住，只剩视频
-- **自带控制条**：全屏下提供播放/暂停、可拖动的进度条、当前时间与总时长（不依赖浏览器原生控件，因此在 YouTube 等会接管原生控件的站点上同样可用）
+- **自带控制条**：全屏下提供播放/暂停、静音、可拖动的进度条、当前时间与总时长（不依赖浏览器原生控件，因此在 YouTube 等会接管原生控件的站点上同样可用）
+- **全屏快捷键**：空格 / K 播放暂停，← / → 快退快进 5 秒，↑ / ↓ 调节音量，M 静音，Esc 退出
 - **多种退出方式**：控制条上的「退出全屏」按钮、`Esc` 键，或扩展弹窗里的「网页全屏」按钮
-- **自动网页全屏**：可在弹窗中开启，视频一开始播放就自动进入网页全屏（自动忽略小尺寸视频，且同一视频只触发一次）
+- **自动网页全屏**：可在弹窗中开启，视频一开始播放就自动进入网页全屏（自动忽略小尺寸视频，且同一视频源只触发一次；同一个 `<video>` 换源后会重新判断）
 - **退出即还原**：视频被放回页面原位置，原始样式与 `controls` 属性一并恢复
 
 ## 安装
@@ -29,6 +31,8 @@
 4. 点击「加载已解压的扩展程序」，选择项目目录
 
 修改代码后，在 `chrome://extensions` 点击该扩展的刷新图标，再刷新目标页面即可生效。
+
+> 需要 Chrome 111 及以上：manifest 使用 `content_scripts.world: "MAIN"`，旧版本会忽略该字段导致主世界拦截失效。
 
 ## 使用说明
 
@@ -44,37 +48,43 @@
 - 规则是**正则表达式**，匹配页面地址（`域名 + 路径 + 查询串`，不含协议与 hash）。例如 `bilibili\.com` 会排除所有含该域名的页面
 - 以 `//` 或 `scheme://` 开头的规则按整条 URL 匹配，例如 `//live\.` 只命中域名以 `live.` 开头的站点
 - 首次使用会预置一组默认规则：`/list/`、`//live\.`、`missav`、`list=WL`、`&list=`、`wanyiwan`
-- 默认规则仅在**未自定义过**时生效；一旦你在设置里增删过，就以保存的列表为准
-- 旧版本默认表里的宽松规则 `live` 会在首次加载时自动迁移为 `//live\.`，之后新增的 `&list=` 也会一并补齐；自定义过的规则表不会被改动
+- 默认规则仅在**未自定义过**时生效（编辑过会写入 `blocklistCustomized` 标志）；一旦你在设置里增删过，就以保存的列表为准
+- 旧版本默认表里的宽松规则 `live` 会在首次加载时自动迁移为 `//live\.`，之后新增的 `&list=` 也会一并补齐；带 `blocklistCustomized` 标志的规则表不会被改动
 - ⚠️ 不要把 `live` 这类短词单独作为规则，它会命中 `?is_live=1`、`alive` 等正常地址
+- 规则区分大小写，host 已转小写；非整条 URL 的规则是在 `host + path + query` 上做子串正则，需要精确匹配时请用 `^` / `$` 锚定，例如 `^bilibili\.com$`
 - 规则按每个 frame 的 URL 分别判断；SPA 站内跳转后约 1.5 秒内重新生效，无需刷新
 
 ## 项目结构
 
 ```
 .
+├── .github/        # CI：语法检查 + 单测；tag 发布
+├── icons/          # 16/32/48/128 图标
+├── tests/          # shared.js 纯逻辑单测（node --test）
 ├── manifest.json   # 扩展清单（Manifest V3）
-├── shared.js       # content.js 与 popup 共用：默认排除表 + 迁移逻辑
-├── content-main.js # 主世界脚本：拦截 playbackRate 写入，压制站点重置
+├── shared.js       # 共用：默认排除表 + 迁移逻辑 + 倍速规范化
+├── content-main.js # 主世界脚本：只拦截受管 <video> 的 playbackRate 写入
 ├── content.js      # 内容脚本：倍速控制 + 网页全屏
 ├── popup.html      # 扩展弹窗界面
-└── popup.js        # 弹窗逻辑：调速面板 + 全屏开关 + 排除网站管理
+├── popup.js        # 弹窗逻辑：调速面板 + 全屏开关 + 排除网站管理
+└── LICENSE
 ```
 
 ## 技术说明
 
 ### 倍速
 
-- **主世界拦截（核心）**：`content-main.js` 在 `document_start` 注入页面主世界，改写 `HTMLMediaElement.prototype` 上 `playbackRate` / `defaultPlaybackRate` 的 setter。页面脚本（如抖音切集时）写入 1x 会被直接改写成目标倍速，而不是「写入成功后再纠正」。这是解决「时不时失效」的关键：仅靠内容脚本事后纠正，纠正频率永远追不上站点的重置频率
-- 拦截器默认 **不启用**，由 `content.js` 通过 `CustomEvent` 告知目标倍速与启用状态；被排除页面保持 `enabled=false`，完全不干预页面行为
-- 扩展自身的写入带 `__vsc_passthrough__` 标记，拦截器会放行，避免自锁
-- 播放期间另有 `requestAnimationFrame` 逐帧守护（≈60Hz），兜住「实例级 defineProperty 覆盖」等绕过原型链的极端情况；无视频播放时自动停止，不常驻空转
+- **主世界拦截（核心）**：`content-main.js` 在 `document_start` 注入页面主世界，改写 `HTMLMediaElement.prototype` 上 `playbackRate` / `defaultPlaybackRate` 的 setter。页面脚本（如抖音切集时）写入 1x 会被直接改写成目标倍速，而不是「写入成功后再纠正」。这是解决「时不时失效」的关键：仅靠内容脚本事后纠正，纠正频率永远追不上站点的重置频率。只对 `content.js` 标记了 `data-vsc-managed` 的 `<video>` 生效，`<audio>` 和其他媒体元素不受影响
+- 拦截器默认 **不启用**，由 `content.js` 通过 `CustomEvent` 告知目标倍速与启用状态；被排除页面、以及 1x 且用户没明确设置过倍速时保持 `enabled=false`，完全不干预页面行为
+- 扩展自身的写入在隔离世界走原生 setter，不经过主世界拦截器，因此不需要任何透传标记；页面自己改写的原型 setter 也不会影响扩展写速
+- `rateExplicit` 记录「用户是否明确选过倍速」：在面板里点过任意倍速（包括 1x）后为 true，此后 1x 也强制；新安装默认 false，1x 不干预
+- 播放期间另有 `requestAnimationFrame` 逐帧守护（≈60Hz），兜住换源、`load()`、缓存的 setter 等绕过拦截器的极端重置；无视频播放时自动停止，不常驻空转
 - `MutationObserver` 监听 DOM 变化，增量扫描新增节点，低频全量扫描兜底捕获晚挂载的 Shadow DOM
 - 监听 `popstate` / `hashchange` / `navigation` 及轮询兜底，处理 SPA 无事件跳转
 - 写速时同时设置 `playbackRate` 与 `defaultPlaybackRate`：站点换 `src` 或调用 `load()` 时浏览器会把播放速度重置为 `defaultPlaybackRate`，只写前者会被立刻打回 1x
 - 监听 `ratechange` / `play` / `playing` / `loadedmetadata` / `canplay` / `emptied` / `loadstart` / `seeking` 等事件实时绑定新出现的 `<video>`
 - 另有 2s 一次的低频校对，清理已断开节点并给未抛 `play` 的视频接上守护
-- 高频互抢时用滑动窗口限流（1 秒内最多 25 次）抑制 ping-pong，但**不设放弃期**
+- 高频互抢时用滑动窗口限流（事件纠正路径 1 秒内最多 25 次，逐帧守护最多 30 次）抑制 ping-pong，但**不设放弃期**
 
 ### 网页全屏
 
@@ -82,14 +92,24 @@
 - 进入全屏时创建铺满视口的高层级遮罩，并把 `<video>` 元素**移入遮罩**，从而脱离原父容器的 `transform` / `overflow` 限制，页面其余内容被完全遮住
 - 全屏控制条为自建实现，直接读写 `video.currentTime` / `duration` 完成拖动跳转，不依赖原生控件，因此在拦截原生控件的站点上依然可用
 - 退出时把视频插回原位置、还原原始 inline 样式与 `controls` 属性，并解绑控制条的事件监听
-- 全屏按钮的定位只遍历扫描阶段缓存的视频列表，避免高频全页遍历带来的性能开销
+- 全屏按钮的定位只遍历已绑定的视频列表 `boundList`，并用 `requestAnimationFrame` 合并滚动/缩放事件，避免高频全页遍历和 layout 抖动
+- 网页全屏按钮与自动全屏只在顶层文档生效；跨域 iframe 内的播放器可以使用倍速，但无法使用网页全屏
 
 ### 数据与通信
 
-- 通过 `chrome.storage.local` 持久化：`rate`（倍速）、`blocklist`（排除规则）、`autoWebFullscreen`（自动全屏开关）
-- 设置变更通过 `chrome.storage.onChanged` 即时生效，无需刷新页面
-- 弹窗与内容脚本通过消息通信：`setSpeed` / `getSpeed` / `toggleWebFullscreen` / `checkBlock`；仅顶层 frame 负责应答
+- 通过 `chrome.storage.local` 持久化：`rate`（倍速）、`rateExplicit`（用户是否明确选过倍速）、`blocklist`（排除规则）、`blocklistCustomized`（规则是否被用户编辑过）、`autoWebFullscreen`（自动全屏开关）
+- 设置变更（含排除规则）通过 `chrome.storage.onChanged` 即时生效，无需刷新页面
+- 弹窗与内容脚本通过消息通信：`setSpeed` / `getSpeed` / `toggleWebFullscreen`；仅顶层 frame 负责应答
+
+## 开发
+
+```bash
+node --check shared.js content.js content-main.js popup.js
+node --test tests/
+```
+
+CI 在 push / PR 时自动执行上述检查；打 `v*` tag 时校验 tag 与 manifest 版本一致并打包。
 
 ## 许可证
 
-MIT
+MIT，见 [LICENSE](LICENSE)。
