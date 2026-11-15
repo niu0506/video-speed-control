@@ -1,6 +1,5 @@
 // popup.js —— 扩展弹窗：调速面板 + 排除网站管理
 const $ = (id) => document.getElementById(id);
-let currentRate = 1.0;
 
 // 切换两个视图
 function showView(name) {
@@ -16,12 +15,10 @@ function setBlockedUI(blocked) {
     b.classList.toggle("dim", blocked)
   );
   $("slider").classList.toggle("dim", blocked);
-  return blocked;
 }
 
 // 更新当前速度 UI（只处理数值与高亮，不涉及提示文案）
 function setCurrent(rate) {
-  currentRate = rate;
   $("current").textContent = rate.toFixed(2) + "x";
   $("slider").value = rate;
   document.querySelectorAll("#presets button").forEach((b) => {
@@ -29,16 +26,14 @@ function setCurrent(rate) {
   });
 }
 
-// 提示文案：「是否被排除」优先于「有无视频」
+// 提示文案：被排除时由 #blocked 横幅负责，这里只报视频数量
 function setTip(blocked, videoCount) {
   if (blocked) {
-    $("tip").textContent = "此页面已被排除，调速未生效";
-  } else {
-    $("tip").textContent =
-      videoCount > 0
-        ? `已应用到 ${videoCount} 个视频`
-        : "未检测到视频（请先播放）";
+    $("tip").textContent = "";
+    return;
   }
+  $("tip").textContent =
+    videoCount > 0 ? `已应用到 ${videoCount} 个视频` : "未检测到视频（请先播放）";
 }
 
 // 向当前标签页的 content script 发送消息
@@ -118,23 +113,15 @@ $("webFullscreen").addEventListener("click", async () => {
 $("openOptions").addEventListener("click", () => showView("block"));
 $("backSpeed").addEventListener("click", () => showView("speed"));
 
-// 仅作 storage 读取失败时的兜底，真实来源是 storage
-// 注意：不要用 `live` 这种短词，会误伤 URL 里含 live 的正常页面
-const DEFAULT_BLOCKLIST = [
-  "/list/",
-  "//live\\.",
-  "missav",
-  "list=WL",
-  "&list=",
-  "wanyiwan",
-];
+// 默认排除表与迁移逻辑见 shared.js（与 content.js 共用，避免两处漂移）
 
 // 读取/保存排除列表
 async function getBlocklist() {
   const { blocklist } = await chrome.storage.local.get({
     blocklist: DEFAULT_BLOCKLIST,
   });
-  return blocklist;
+  // 与内容脚本一致地升级历史默认表，避免弹窗显示旧规则
+  return migrateBlocklist(blocklist);
 }
 
 async function saveBlocklist(list) {

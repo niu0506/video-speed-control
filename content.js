@@ -3,37 +3,7 @@ let currentRate = 1.0;
 let blocked = false;
 let autoFullscreen = false;
 
-// 历史默认表：命中其中任一份，说明用户从未自定义过排除规则，
-// 升级为当前默认表。第一份是初版（`live` 宽松匹配会误伤 `?is_live=1` 这类地址），
-// 第二份是加入 `&list=` 之前的版本。
-const HISTORICAL_DEFAULT_BLOCKLISTS = [
-  ["/list/", "live", "missav", "list=WL", "wanyiwan"],
-  ["/list/", "//live\\.", "missav", "list=WL", "wanyiwan"],
-];
-
-// 仅作 storage 读取失败时的兜底，真实来源是 storage
-const DEFAULT_BLOCKLIST = [
-  "/list/",
-  "//live\\.",
-  "missav",
-  "list=WL",
-  "&list=",
-  "wanyiwan",
-];
-
-function sameList(a, b) {
-  return a.length === b.length && a.every((p, i) => p === b[i]);
-}
-
-// 把未改动过的历史默认表升级成当前默认表
-// 用户自己加过/删过规则的列表不会被改动
-function migrateBlocklist(list) {
-  if (!HISTORICAL_DEFAULT_BLOCKLISTS.some((def) => sameList(def, list))) {
-    return list;
-  }
-  chrome.storage.local.set({ blocklist: DEFAULT_BLOCKLIST });
-  return DEFAULT_BLOCKLIST;
-}
+// 默认排除表与迁移逻辑见 shared.js（与 popup 共用，避免两处漂移）
 
 // 排除规则匹配语义：
 // 规则可能是域名（bilibili\.com）、路径（/list/）或参数（list=WL）。
@@ -102,15 +72,13 @@ function collectVideos(root) {
   return videos;
 }
 
-// 外部持续改速时的写入限流：只做滑动窗口限速，不设「放弃期」。
-// 旧实现是「累计 5 次就静默 10 秒」，而站点每次重置速度都算一次，
-// 刷几个视频就进入静默期且结束后无人补救 → 表现成「时不时失效」。
-// 这里只防真正的 ping-pong 死循环：1 秒内写超过 25 次就跳过本次，
-// 但 500ms 一次的低频校对不受限，保证最多 0.5s 后一定回到目标倍速。
+// 外部持续改速时的写入限流：滑动窗口限速，不设「放弃期」。
+// 只防真正的 ping-pong 死循环：1 秒内写超过 WRITE_LIMIT 次就跳过本次，
+// 后续事件或守护循环会继续尝试，不会出现长时间静默。
 const WRITE_WINDOW = 1000;
 const WRITE_LIMIT = 25;
 
-// 已绑定的视频：WeakSet 用于去重，boundList 用于低频校对时遍历
+// 已绑定的视频：WeakSet 用于去重，boundList 供高频守护/按钮定位遍历
 const boundVideos = new WeakSet();
 const boundList = [];
 
@@ -120,8 +88,8 @@ const writeLogs = new WeakMap();
 // 正在由本扩展写速的视频：避免自己写的值又触发 ratechange 造成自锁/重复计数
 const writing = new WeakSet();
 
-// 限流：同一视频 1 秒内最多纠正 WRITE_LIMIT 次，超出就跳过本次（下个事件/校对再补）
-function canWrite(v) {
+// 限流：同一视频在 WRITE_WINDOW 内最多写 limit 次；超出则跳过本次
+function canWriteWithin(v, limit) {
   const now = Date.now();
   let log = writeLogs.get(v);
   if (!log) {
@@ -129,9 +97,14 @@ function canWrite(v) {
     writeLogs.set(v, log);
   }
   while (log.length && now - log[0] > WRITE_WINDOW) log.shift();
-  if (log.length >= WRITE_LIMIT) return false;
+  if (log.length >= limit) return false;
   log.push(now);
   return true;
+}
+
+// 事件纠正路径的限流（守护路径用更宽的 KEEP_LIMIT）
+function canWrite(v) {
+  return canWriteWithin(v, WRITE_LIMIT);
 }
 
 // 同时写 defaultPlaybackRate：媒体重新加载（换 src / load()）时浏览器会把
@@ -242,30 +215,16 @@ function bindNewVideos(videos) {
 }
 
 // ===== 倍速守护 =====
-// 关键认知：抖音这类站点在播放/切集时会以远高于「事件 + 定时校对」的频率
-// 把 playbackRate 写回 1。只要我们的纠正频率低于站点的重置频率，
-// 视频就始终跑在站点的倍速上 —— 这正是「加了校对还是时不时失效」的原因。
-// （站点 100ms 重置一次、我们 500ms 校对一次 → 5/6 的时间是 1x。）
+// 兜底链路（主世界拦截已能从源头吞掉站点写入，这里是第二道保险）：
+// 抖音这类站点会在播放/切集时把 playbackRate 写回 1，若只靠事件 + 定时校对，
+// 纠正频率一旦低于重置频率，视频就始终跑在站点的倍速上。
 //
-// 因此播放期间改用 rAF 逐帧守护（≈60Hz），一旦发现被改就立刻写回，
+// 因此播放期间用 rAF 逐帧守护（≈60Hz），一旦发现被改就立刻写回，
 // 站点的重置最多只生效一帧（<17ms），肉眼不可见。
 // rAF 只在「有视频正在播放」时运行，暂停/离开后自动停止，不常驻空转。
 
 // 守护写入的每秒上限：既压住真正的 ping-pong，又远高于站点的重置频率
 const KEEP_LIMIT = 30;
-
-function canWriteWithin(v, limit) {
-  const now = Date.now();
-  let log = writeLogs.get(v);
-  if (!log) {
-    log = [];
-    writeLogs.set(v, log);
-  }
-  while (log.length && now - log[0] > WRITE_WINDOW) log.shift();
-  if (log.length >= limit) return false;
-  log.push(now);
-  return true;
-}
 
 // 强制写回目标倍速（守护路径，限额放宽到 KEEP_LIMIT）
 function forceRate(v) {
@@ -365,8 +324,6 @@ const FULL_SCAN_INTERVAL = 2500;
 let scanTimer = null;
 let pendingAdded = [];
 let lastFullScan = 0;
-// 扫描阶段缓存的视频列表，供按钮定位复用，避免高频全页遍历
-let knownVideos = [];
 
 function scheduleScan(mutations) {
   if (mutations) {
@@ -383,35 +340,17 @@ function scheduleScan(mutations) {
     if (now - lastFullScan >= FULL_SCAN_INTERVAL) {
       lastFullScan = now;
       if (fsVideo && !fsVideo.isConnected) exitWebFullscreen();
-      // 保留待处理的增量节点：全量分支只做补充，不能把本轮新节点丢掉，
-      // 否则这些视频要等下一次 DOM 变动或 2.5s 后的全量扫描才有倍速
-      const added = pendingAdded;
-      pendingAdded = [];
-      const videos = collectVideos(document);
-      knownVideos = videos;
-      bindNewVideos(videos);
-      for (const el of added) {
-        const extra = collectFrom(el);
-        knownVideos.push(...extra);
-        bindNewVideos(extra);
-      }
-      updateTrackBtn();
+      // 全量扫描覆盖整棵文档树（含已发现的 shadow root），
+      // 新节点也已包含在内，无需再单独处理 pendingAdded
+      pendingAdded.length = 0;
+      bindNewVideos(collectVideos(document));
       return;
     }
     const added = pendingAdded;
     pendingAdded = [];
-    // 顺带清理已断开的旧节点，避免列表无限增长
-    if (knownVideos.length > 64) {
-      knownVideos = knownVideos.filter((v) => v.isConnected);
-    }
     for (const el of added) {
-      const videos = collectFrom(el);
-      for (const v of videos) {
-        if (!knownVideos.includes(v)) knownVideos.push(v);
-      }
-      bindNewVideos(videos);
+      bindNewVideos(collectFrom(el));
     }
-    updateTrackBtn();
   }, 100);
 }
 
@@ -427,7 +366,16 @@ let fsWheelHandler = null;
 
 // 选择目标视频：优先正在播放的
 function pickVideo() {
+  let fallback = null;
+  for (const v of boundList) {
+    if (!v.isConnected) continue;
+    if (!v.paused && !v.ended) return v;
+    if (!fallback) fallback = v;
+  }
+  if (fallback) return fallback;
+  // 兜底：列表还空（页面刚打开、尚未扫描到视频）时做一次扫描并绑定
   const videos = collectVideos(document);
+  videos.forEach(bindVideo);
   return videos.find((v) => !v.paused && !v.ended) || videos[0] || null;
 }
 
@@ -795,12 +743,13 @@ let trackBtn = null;
 let trackedVideo = null;
 
 // 挑选当前最值得操作的视频：可见、面积大、正在播放的优先
+// 复用 boundList（所有绑定过的视频），避免每次定位都全页遍历
 function pickTrackedVideo() {
   const vw = window.innerWidth;
   const vh = window.innerHeight;
   let best = null;
   let bestScore = -1;
-  for (const v of knownVideos) {
+  for (const v of boundList) {
     if (!v.isConnected) continue;
     const r = v.getBoundingClientRect();
     const w = Math.min(r.right, vw) - Math.max(r.left, 0);
@@ -942,7 +891,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (isTop) {
       sendResponse({
         rate: currentRate,
-        count: collectVideos(document).length,
+        count: boundList.filter((v) => v.isConnected).length,
         blocked,
         webFullscreen: !!fsVideo,
       });
@@ -1019,7 +968,6 @@ chrome.storage.onChanged.addListener((changes, area) => {
       } else {
         applySpeed(rate);
       }
-      knownVideos = collectVideos(document);
       updateTrackBtn();
     }
   );

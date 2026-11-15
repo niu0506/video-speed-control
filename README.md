@@ -9,7 +9,7 @@
 - **快捷调速**：预设 0.5x / 1x / 1.5x / 2x / 3x / 4x / 8x / 16x 按钮，也可用滑块精确调节（步进 0.25）
 - **自动应用**：速度设置会保存，新页面、新视频、SPA 路由跳转后自动生效
 - **全页面生效**：注入所有 http/https 页面（含 iframe），支持穿透 Shadow DOM
-- **对抗外部改速**：网站脚本重置播放速度时自动纠正；同时写入 `defaultPlaybackRate`，换源重新加载后也不会被打回 1x
+- **对抗外部改速**：在主世界拦截 `playbackRate` 写入，站点把速度改回 1x 的写入会被直接改写成目标倍速；同时写入 `defaultPlaybackRate`，换源重新加载后也不会被打回 1x
 - **排除网站**：按正则匹配页面地址（域名 + 路径 + 查询串），命中规则的页面不会被加速
 
 ### 网页全屏
@@ -54,6 +54,7 @@
 ```
 .
 ├── manifest.json   # 扩展清单（Manifest V3）
+├── shared.js       # content.js 与 popup 共用：默认排除表 + 迁移逻辑
 ├── content-main.js # 主世界脚本：拦截 playbackRate 写入，压制站点重置
 ├── content.js      # 内容脚本：倍速控制 + 网页全屏
 ├── popup.html      # 扩展弹窗界面

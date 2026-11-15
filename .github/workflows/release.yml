@@ -19,7 +19,7 @@ jobs:
         run: |
           mkdir -p dist
           zip -r "dist/video-speed-control-${{ github.ref_name }}.zip" \
-            manifest.json content.js content-main.js popup.html popup.js
+            manifest.json shared.js content.js content-main.js popup.html popup.js
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

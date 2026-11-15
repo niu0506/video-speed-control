@@ -170,8 +170,8 @@
   <div id="blockView" style="display:none">
     <h1>排除网站</h1>
     <p class="desc">
-      命中以下任一正则的页面将<b>不会被加速</b>。正则匹配完整 URL，例如
-      <code>bilibili\.com</code>。规则按每个 frame 的 URL 分别判断；SPA 站内
+      命中以下任一正则的页面将<b>不会被加速</b>。正则匹配页面地址（域名 + 路径 + 查询串），
+      例如 <code>bilibili\.com</code>。规则按每个 frame 的 URL 分别判断；SPA 站内
       跳转后约 1.5 秒内重新生效，无需刷新。
     </p>
     <div class="add-row">
@@ -183,6 +183,7 @@
     <div class="empty" id="empty">暂无排除规则</div>
     <span class="settings" id="backSpeed">← 返回调速</span>
   </div>
+  <script src="shared.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

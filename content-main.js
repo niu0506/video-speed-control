@@ -33,7 +33,7 @@
     return enabled && Number.isFinite(target) && target > 0;
   }
 
-  function patch(name, desc, valueOf) {
+  function patch(name, desc) {
     if (!desc || !desc.set || !desc.get) return;
     Object.defineProperty(PROTO, name, {
       configurable: true,
@@ -50,17 +50,17 @@
           return desc.set.call(this, value);
         }
         // 页面写入的值本来就是目标倍速：照常放行（避免无谓的 ratechange）
-        if (Math.abs(value - valueOf()) < 1e-6) {
+        if (Math.abs(value - target) < 1e-6) {
           return desc.set.call(this, value);
         }
         // 页面脚本想改成别的速度：改写成目标倍速
-        return desc.set.call(this, valueOf());
+        return desc.set.call(this, target);
       },
     });
   }
 
-  patch(RATE, rateDesc, () => target);
-  patch(DEF_RATE, defDesc, () => target);
+  patch(RATE, rateDesc);
+  patch(DEF_RATE, defDesc);
 
   // 接收隔离世界的控制消息（DOM 事件可以跨世界传递）
   document.addEventListener("__vsc_set_rate__", (e) => {
