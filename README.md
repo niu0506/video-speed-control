@@ -54,6 +54,7 @@
 ```
 .
 ├── manifest.json   # 扩展清单（Manifest V3）
+├── content-main.js # 主世界脚本：拦截 playbackRate 写入，压制站点重置
 ├── content.js      # 内容脚本：倍速控制 + 网页全屏
 ├── popup.html      # 扩展弹窗界面
 └── popup.js        # 弹窗逻辑：调速面板 + 全屏开关 + 排除网站管理
@@ -63,12 +64,16 @@
 
 ### 倍速
 
+- **主世界拦截（核心）**：`content-main.js` 在 `document_start` 注入页面主世界，改写 `HTMLMediaElement.prototype` 上 `playbackRate` / `defaultPlaybackRate` 的 setter。页面脚本（如抖音切集时）写入 1x 会被直接改写成目标倍速，而不是「写入成功后再纠正」。这是解决「时不时失效」的关键：仅靠内容脚本事后纠正，纠正频率永远追不上站点的重置频率
+- 拦截器默认 **不启用**，由 `content.js` 通过 `CustomEvent` 告知目标倍速与启用状态；被排除页面保持 `enabled=false`，完全不干预页面行为
+- 扩展自身的写入带 `__vsc_passthrough__` 标记，拦截器会放行，避免自锁
+- 播放期间另有 `requestAnimationFrame` 逐帧守护（≈60Hz），兜住「实例级 defineProperty 覆盖」等绕过原型链的极端情况；无视频播放时自动停止，不常驻空转
 - `MutationObserver` 监听 DOM 变化，增量扫描新增节点，低频全量扫描兜底捕获晚挂载的 Shadow DOM
 - 监听 `popstate` / `hashchange` / `navigation` 及轮询兜底，处理 SPA 无事件跳转
 - 写速时同时设置 `playbackRate` 与 `defaultPlaybackRate`：站点换 `src` 或调用 `load()` 时浏览器会把播放速度重置为 `defaultPlaybackRate`，只写前者会被立刻打回 1x
-- 监听 `ratechange` / `play` / `playing` / `loadedmetadata` / `canplay` / `emptied` / `loadstart` / `seeking` 等事件纠正外部改速
-- 另有 500ms 一次的低频校对，兜住「事件被限流」或「站点重置后不抛事件」的情况；只遍历已绑定的少数 `<video>`，开销可忽略
-- 高频互抢时用滑动窗口限流（1 秒内最多 25 次）抑制 ping-pong，但**不设放弃期**：校对路径始终生效，最迟 0.5 秒回到目标倍速
+- 监听 `ratechange` / `play` / `playing` / `loadedmetadata` / `canplay` / `emptied` / `loadstart` / `seeking` 等事件实时绑定新出现的 `<video>`
+- 另有 2s 一次的低频校对，清理已断开节点并给未抛 `play` 的视频接上守护
+- 高频互抢时用滑动窗口限流（1 秒内最多 25 次）抑制 ping-pong，但**不设放弃期**
 
 ### 网页全屏
 

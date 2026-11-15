@@ -136,10 +136,12 @@ function canWrite(v) {
 
 // 同时写 defaultPlaybackRate：媒体重新加载（换 src / load()）时浏览器会把
 // playbackRate 重置成 defaultPlaybackRate，只写 playbackRate 会被打回 1x
+// 写入时打上透传标记：主世界的 setter 拦截器会放行扩展自己的写入。
 function setRate(v, rate) {
   if (writing.has(v)) return;
   writing.add(v);
   try {
+    v.__vsc_passthrough__ = true;
     if (Math.abs(v.defaultPlaybackRate - rate) > 1e-6) {
       v.defaultPlaybackRate = rate;
     }
@@ -147,8 +149,22 @@ function setRate(v, rate) {
   } catch {
     // 视频已进入不可写状态（如被移除），忽略
   } finally {
+    try {
+      v.__vsc_passthrough__ = false;
+    } catch {}
     writing.delete(v);
   }
+}
+
+// 把目标倍速同步给主世界拦截器；enabled=false 时它完全不干预页面
+function syncMainWorld() {
+  try {
+    document.dispatchEvent(
+      new CustomEvent("__vsc_set_rate__", {
+        detail: { rate: currentRate, enabled: !blocked },
+      })
+    );
+  } catch {}
 }
 
 // 当前视频速度是否已是我们想要的状态
@@ -164,12 +180,14 @@ function bindVideo(v) {
   if (!boundVideos.has(v)) {
     boundVideos.add(v);
 
-    // 站点脚本 / 自动连播 / 长按加速改动速度时纠正回来
+    // 站点脚本 / 自动连播 / 长按加速改动速度时纠正回来。
+    // 若视频正在播放，直接拉起逐帧守护，让站点的重置只生效一帧。
     v.addEventListener("ratechange", () => {
       if (blocked) return;
       if (Math.abs(v.playbackRate - currentRate) < 1e-6) return;
       if (!canWrite(v)) return;
       setRate(v, currentRate);
+      if (!v.paused && !v.ended) startKeeper();
     });
 
     // 换源重新加载与起播阶段补一次，覆盖 ratechange 被限流的窗口
@@ -185,9 +203,11 @@ function bindVideo(v) {
     ].forEach((evt) => {
       v.addEventListener(evt, () => {
         if (blocked) return;
-        if (rateMatches(v, currentRate)) return;
-        if (!canWrite(v)) return;
-        setRate(v, currentRate);
+        if (!rateMatches(v, currentRate) && canWrite(v)) {
+          setRate(v, currentRate);
+        }
+        // 播放/起播后拉起守护，靠它压制站点持续重置
+        if (!v.paused && !v.ended) startKeeper();
       });
     });
 
@@ -201,11 +221,14 @@ function bindVideo(v) {
 // 将速度应用到所有视频（用户主动操作，不经过限流）
 function applySpeed(rate) {
   currentRate = rate;
+  syncMainWorld();
   const videos = collectVideos(document);
   for (const v of videos) {
     bindVideo(v);
     setRate(v, rate);
   }
+  // 用户改速后立即拉起守护，压制站点随后可能的重置
+  if (videos.some((v) => !v.paused && !v.ended)) startKeeper();
   return videos.length;
 }
 
@@ -218,23 +241,111 @@ function bindNewVideos(videos) {
   }
 }
 
-// 低频校对：兜住「事件被限流」或「站点重置后没抛事件」导致的掉速。
-// 这是对付复用同一个 <video> 的站点（抖音 feed、B 站、YouTube）最有效的一招。
-// 每 500ms 一次、只遍历已绑定且仍连接的少数 video，开销可忽略。
-// 校对是最后的兜底，不走 canWrite 限流（每个视频每秒最多 2 次，本身已很轻），
-// 这样即使站点高频重置把事件配额打满，最多 0.5s 后也一定能回到目标倍速。
-const SWEEP_INTERVAL = 500;
+// ===== 倍速守护 =====
+// 关键认知：抖音这类站点在播放/切集时会以远高于「事件 + 定时校对」的频率
+// 把 playbackRate 写回 1。只要我们的纠正频率低于站点的重置频率，
+// 视频就始终跑在站点的倍速上 —— 这正是「加了校对还是时不时失效」的原因。
+// （站点 100ms 重置一次、我们 500ms 校对一次 → 5/6 的时间是 1x。）
+//
+// 因此播放期间改用 rAF 逐帧守护（≈60Hz），一旦发现被改就立刻写回，
+// 站点的重置最多只生效一帧（<17ms），肉眼不可见。
+// rAF 只在「有视频正在播放」时运行，暂停/离开后自动停止，不常驻空转。
+
+// 守护写入的每秒上限：既压住真正的 ping-pong，又远高于站点的重置频率
+const KEEP_LIMIT = 30;
+
+function canWriteWithin(v, limit) {
+  const now = Date.now();
+  let log = writeLogs.get(v);
+  if (!log) {
+    log = [];
+    writeLogs.set(v, log);
+  }
+  while (log.length && now - log[0] > WRITE_WINDOW) log.shift();
+  if (log.length >= limit) return false;
+  log.push(now);
+  return true;
+}
+
+// 强制写回目标倍速（守护路径，限额放宽到 KEEP_LIMIT）
+function forceRate(v) {
+  if (!canWriteWithin(v, KEEP_LIMIT)) return false;
+  setRate(v, currentRate);
+  return true;
+}
+
+let keeperRunning = false;
+
+function keepTick() {
+  if (blocked) {
+    keeperRunning = false;
+    return;
+  }
+  let anyPlaying = false;
+  for (let i = boundList.length - 1; i >= 0; i--) {
+    const v = boundList[i];
+    if (!v.isConnected) continue;
+    if (v.paused || v.ended) continue;
+    anyPlaying = true;
+    if (rateMatches(v, currentRate)) continue;
+    forceRate(v);
+  }
+  if (anyPlaying) {
+    requestAnimationFrame(keepTick);
+  } else {
+    keeperRunning = false;
+  }
+}
+
+// 启动守护：有视频在播时才跑
+function startKeeper() {
+  if (blocked || keeperRunning) return;
+  keeperRunning = true;
+  requestAnimationFrame(keepTick);
+}
+
+// 文档级捕获监听：抖音等站点会不断新建 <video> 元素，
+// 靠 MutationObserver（100ms 防抖）或全量扫描（2.5s）绑定都存在延迟窗口，
+// 这期间新视频就是原速播放。用捕获阶段监听媒体事件可以即时绑定并立刻拉起守护。
+["play", "playing", "ratechange", "loadedmetadata"].forEach((evt) => {
+  document.addEventListener(
+    evt,
+    (e) => {
+      const v = e.target;
+      if (!(v instanceof HTMLMediaElement)) return;
+      if (blocked) return;
+      if (!boundVideos.has(v)) {
+        bindVideo(v);
+        setRate(v, currentRate);
+      }
+      if (!v.paused && !v.ended) {
+        if (!rateMatches(v, currentRate) && canWrite(v)) {
+          setRate(v, currentRate);
+        }
+        startKeeper();
+      }
+    },
+    true
+  );
+});
+
+// 低频兜底扫描：清理断开节点，并给「没抛 play 事件」的视频也接上守护
+const SWEEP_INTERVAL = 2000;
 setInterval(() => {
   if (blocked) return;
+  let anyPlaying = false;
   for (let i = boundList.length - 1; i >= 0; i--) {
     const v = boundList[i];
     if (!v.isConnected) {
       boundList.splice(i, 1);
       continue;
     }
+    if (!v.paused && !v.ended) anyPlaying = true;
     if (rateMatches(v, currentRate)) continue;
+    if (!canWriteWithin(v, WRITE_LIMIT)) continue;
     setRate(v, currentRate);
   }
+  if (anyPlaying) startKeeper();
 }, SWEEP_INTERVAL);
 
 // 收集单个新增节点（含自身）里的视频
@@ -901,6 +1012,8 @@ chrome.storage.onChanged.addListener((changes, area) => {
       setBlocklist(rules);
       autoFullscreen = !!autoFs;
       blocked = isBlockedUrl(location.href);
+      // 先告诉主世界当前倍速与是否启用，再应用到视频
+      syncMainWorld();
       if (blocked) {
         collectVideos(document).forEach(bindVideo);
       } else {
